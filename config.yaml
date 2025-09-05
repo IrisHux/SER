@@ -1,0 +1,50 @@
+project_root: "E:/Unitec/SER/audio"
+
+data_source:
+  # 数据目录，相对于 project_root
+  # path: "dataset"
+  path: "E:/Unitec/SER/dataset"
+dataset:
+  # 训练集名称
+  training_set: "IEMOCAP"
+  # 用于零样本/未见过评估的数据集名称
+  evaluation_set: "CREMA-D"
+
+dataset_specific:
+  IEMOCAP:
+    # 预处理目录，相对于 data_source/IEMOCAP
+    preprocessed_dir: "Preprocessed"
+    emotions: ["ang",  "neu", "sad", "hap"]
+  CREMA-D:
+    # 预处理目录，相对于 data_source/CREMA-D
+    preprocessed_dir: "Preprocessed"
+    emotions: ["ang",  "neu", "sad", "hap"] # Assuming same emotions for evaluation
+
+
+dataloader:
+  batch_size: 8
+  num_workers: 4
+
+models:
+  # 模型保存目录，相对于 project_root
+  save_location: "saved_models"
+  # 音频编码器模型名称 (WavLM-Base+)
+  audio_encoder: "microsoft/wavlm-base"
+  # 文本编码器模型名称 (DeBERTa-V3-Base)
+  text_encoder: "microsoft/deberta-v3-base"
+  # MLP投影桥配置
+  projection_bridge:
+    layers: 2 # 投影桥层数
+    hidden_dims: [512, 256] # 隐藏层维度 (可以根据需要调整)
+
+training:
+  epochs: 10
+  learning_rate: 0.00002
+  optimizer: "AdamW"
+  loss_weights:
+    alpha: 5.0 # 经过验证的最优值
+    # LLGCA loss 的权重 (α)
+
+plots:
+  # 图片保存目录，相对于 project_root
+  save_location: "pictures"
