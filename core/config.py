@@ -87,6 +87,13 @@ class CONFIG:
             os.makedirs(save_path, exist_ok=True)
         return save_path
 
+    @classmethod
+    def save_tables_location(cls):
+        save_path = os.path.join(cls.project_root(), cls._dict["table"]["save_location"])
+        if not os.path.exists(save_path):
+            os.makedirs(save_path, exist_ok=True)
+        return save_path
+
     # New methods for model configurations
     @classmethod
     def audio_encoder_name(cls):

@@ -222,13 +222,12 @@ class ContrastiveTrainer(AbstractTrainer):
                         epoch_val_accuracies.append(val_accuracy.item())
 
                 # 计算并存储该epoch的平均验证指标
-                avg_val_loss = sum(epoch_val_losses) / len(epoch_val_losses)
-                avg_val_acc = sum(epoch_val_accuracies) / len(epoch_val_accuracies)
+
                 history_val_loss.append(np.mean(epoch_val_losses))
-                history_val_acc.append(np.mean(epoch_val_losses))
+                history_val_acc.append(np.mean(epoch_val_accuracies))
                 
                 logger.info(f"Epoch {epoch} 总结: 训练损失: {history_train_loss[-1]:.4f}, 训练准确率: {history_train_acc[-1]:.4f}, "
-                            f"验证损失: {avg_val_loss:.4f}, 验证准确率: {avg_val_acc:.4f}")
+                            f"验证损失: {np.mean(epoch_val_losses):.4f}, 验证准确率: {np.mean(epoch_val_accuracies):.4f}")
                 
         # print("total_loss = loss_sup_con")
         # print("total_loss = loss_ce")
@@ -349,7 +348,7 @@ class AblationTrainer(ContrastiveTrainer):
                 with torch.no_grad():
                     for batch in val_loader:
                         if not batch: continue
-                        
+                        # 需要修改
                         acoustic_embedding, text_embedding, audio_logits, labels = self._get_outputs_and_labels(batch)
                         
                         with torch.amp.autocast('cuda'):

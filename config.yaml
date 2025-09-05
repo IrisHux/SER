@@ -48,3 +48,7 @@ training:
 plots:
   # 图片保存目录，相对于 project_root
   save_location: "pictures"
+
+
+table:
+  save_location: "tables"
