@@ -2,8 +2,8 @@ project_root: "E:/Unitec/SER/audio"
 
 data_source:
   # 数据目录，相对于 project_root
-  # path: "dataset"
-  path: "E:/Unitec/SER/dataset"
+  path: "dataset"
+  # path: "E:/Unitec/SER/dataset"
 dataset:
   # 训练集名称
   training_set: "IEMOCAP"

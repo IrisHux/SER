@@ -30,10 +30,10 @@ class CONFIG:
     @classmethod
     def _path_from_data(cls, path: str):
         base_data_path = cls._dict["data_source"]["path"]
-        if os.path.isabs(base_data_path):
-            return os.path.join(base_data_path, path)
-        else:
-            return os.path.join(cls.project_root(), base_data_path, path)
+        # if os.path.isabs(base_data_path):
+        #     return os.path.join(base_data_path, path)
+        # else:
+        return os.path.join(cls.project_root(), base_data_path, path)
 
     # Modified dataset_path to return path based on current dataset context (training/evaluation)
     # This might need further refinement depending on how it's used later
