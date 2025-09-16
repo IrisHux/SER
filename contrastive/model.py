@@ -131,6 +131,10 @@ class ContrastiveModel(nn.Module):
         self.audio_encoder = WavLMModel.from_pretrained(CONFIG.audio_encoder_name(), use_safetensors = True)
         self.text_encoder = AutoModel.from_pretrained(CONFIG.text_encoder_name(), use_safetensors = True)
 
+        # 冻结部分编码器层以减少训练时的计算量和内存占用
+        # 这里我们冻结 WavLM 的 CNN 特征提取器和 DeBERTa 的前6层 Transformer 层
+        self._freeze_model_parts(num_text_layers_to_freeze=6)
+
         # 获取编码器的输出维度，通常对于 "base" 模型是 768
         audio_hidden_size = self.audio_encoder.config.hidden_size
         text_hidden_size = self.text_encoder.config.hidden_size
@@ -159,6 +163,50 @@ class ContrastiveModel(nn.Module):
         # 它的输入是声学编码器的原始特征 (投影之前)。
         self.audio_classifier = nn.Linear(audio_hidden_size, num_labels)
 
+    def _freeze_model_parts(self, num_text_layers_to_freeze: int):
+        """
+        [内部方法] 冻结编码器的特定部分。
+        这个方法会直接修改 self.audio_encoder 和 self.text_encoder。
+        (此逻辑基于你原始的 __init__ 方法)
+        """
+        
+        # --- 1. 冻结 WavLM 的 CNN 特征提取器 ---
+        print("--- [修改] 正在冻结 WavLM 的 CNN Feature Extractor ---")
+        if hasattr(self.audio_encoder, 'feature_extractor'):
+            for param in self.audio_encoder.feature_extractor.parameters():
+                param.requires_grad = False
+        else:
+            print("[警告] audio_encoder 没有 'feature_extractor' 属性，跳过冻结。")
+
+        # --- 2. 冻结 DeBERTa 的 Embedding 层 ---
+        print("--- [修改] 正在冻结 DeBERTa 的 Embeddings ---")
+        if hasattr(self.text_encoder, 'embeddings'):
+            for param in self.text_encoder.embeddings.parameters():
+                param.requires_grad = False
+        else:
+            print("[警告] text_encoder 没有 'embeddings' 属性，跳过冻结。")
+
+        # --- 3. 冻结 DeBERTa 的底层 Transformer ---
+        print(f"--- [修改] 正在冻结 DeBERTa 的 Encoder 前 {num_text_layers_to_freeze} 层 ---")
+        if (hasattr(self.text_encoder, 'encoder') and 
+            hasattr(self.text_encoder.encoder, 'layer') and 
+            len(self.text_encoder.encoder.layer) > 0):
+            
+            total_layers = len(self.text_encoder.encoder.layer)
+            layers_to_freeze = min(num_text_layers_to_freeze, total_layers)
+
+            if layers_to_freeze < num_text_layers_to_freeze:
+                 print(f"[警告] 想要冻结 {num_text_layers_to_freeze} 层, "
+                       f"但模型只有 {total_layers} 层。将只冻结 {layers_to_freeze} 层。")
+
+            for i, layer in enumerate(self.text_encoder.encoder.layer):
+                if i < layers_to_freeze:
+                    for param in layer.parameters():
+                        param.requires_grad = False
+        else:
+            print("[警告] text_encoder 没有 'encoder.layer' 结构，跳过底层 Transformer 冻结。")
+
+        print("--- 编码器冻结操作完成 ---")
 
     def forward(self, audio_input_values, text_input_ids=None, text_attention_mask=None):
         """

@@ -2,6 +2,7 @@
 
 import torch
 import pandas as pd
+import itertools
 from torch.utils.data import DataLoader, Subset # 确保导入 Subset
 import warnings # <-- 新增
 

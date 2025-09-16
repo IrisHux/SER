@@ -39,7 +39,9 @@ models:
 
 training:
   epochs: 15
-  learning_rate: 0.00002
+  learning_rate: 0.00005
+  head_lr: 0.001
+  weight_decay: 0.01
   optimizer: "AdamW"
   loss_weights:
     alpha: 4.0 # 经过验证的最优值

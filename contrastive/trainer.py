@@ -7,6 +7,7 @@ import logging
 import gc
 import os
 import numpy as np
+import itertools
 
 from core.trainer import AbstractTrainer
 from core.config import CONFIG, device
@@ -29,9 +30,39 @@ class ContrastiveTrainer(AbstractTrainer):
 
         # --- 1. 初始化优化器和损失函数 ---
         if optimizer_type.lower() == "adamw":
-            optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+            # --- 新的差分学习率逻辑 ---
+            
+            # 1. 定义学习率
+            #    从构造函数传入的 learning_rate 作为 backbone_lr
+            # backbone_lr = learning_rate 
+
+            #    从 CONFIG 读取新的 head_lr
+            head_lr = CONFIG.training_head_lr()
+
+            print(f"--- [优化器配置] Backbone LR: {learning_rate}, Head LR: {head_lr} ---")
+
+            # 2. 将参数分组
+            # (这会自动处理您之前可能设置的任何 'requires_grad=False' 冻结层)
+            backbone_params = itertools.chain(
+                self.model.audio_encoder.parameters(),
+                self.model.text_encoder.parameters()
+            )
+            
+            head_params = itertools.chain(
+                self.model.audio_projection_head.parameters(),
+                self.model.text_projection_head.parameters(),
+                self.model.audio_classifier.parameters()
+            )
+            
+            # 3. 创建参数组列表
+            optimizer_parameters = [
+                {"params": backbone_params, "lr": learning_rate},
+                {"params": head_params, "lr": head_lr}
+            ]
+
+            optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=CONFIG.weight_decay())
         else: # 默认为 Adam
-            optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+            optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=CONFIG.weight_decay())
 
         # 实例化两个损失函数：监督对比损失L_LGCA 和 交叉熵损失L_SER
         self.sup_con_loss = SupConLoss(temperature=0.1)

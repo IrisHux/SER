@@ -107,7 +107,6 @@ class CONFIG:
     def projection_bridge_config(cls):
         return cls._dict["models"]["projection_bridge"]
 
-    # New methods for training configurations
     @classmethod
     def training_epochs(cls):
         return cls._dict["training"]["epochs"]
@@ -115,6 +114,16 @@ class CONFIG:
     @classmethod
     def learning_rate(cls):
         return cls._dict["training"]["learning_rate"]
+    
+    @classmethod
+    def training_head_lr(cls):
+        """获取新添加的“头”部的学习率"""
+        return float(cls._dict["training"]["head_lr"])
+    
+    @classmethod
+    def weight_decay(cls):
+        """获取权重衰减参数"""
+        return float(cls._dict["training"]["weight_decay"])
 
     @classmethod
     def optimizer_type(cls):
