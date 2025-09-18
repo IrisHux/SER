@@ -14,7 +14,7 @@ warnings.filterwarnings("ignore", category=UserWarning)
 from core.config import CONFIG, device
 from dataloaders.dataset import EmotionDataset
 from contrastive.collator import ContrastiveDataCollator
-from contrastive.model import ContrastiveModel
+from contrastive.model import ContrastiveModel, MemoryOptimizedContrastiveModel
 from contrastive.trainer import ContrastiveTrainer
 # 确保您已经创建了这个新的数据加载器脚本
 from scripts.get_dataloaders import get_contrastive_dataloaders
@@ -46,7 +46,8 @@ def run_hyperparameter_trial(alpha_value: float,
     # 1. 初始化模型和优化器
     # 每次调用都创建一个全新的模型实例，确保实验的独立性
     num_labels = len(CONFIG.dataset_emotions(CONFIG.training_dataset_name()))
-    model = ContrastiveModel(num_labels=num_labels).to(device)
+    # model = ContrastiveModel(num_labels=num_labels).to(device)
+    model = MemoryOptimizedContrastiveModel(num_labels=num_labels).to(device)
 
     # 将 alpha_value 传递给训练器
     trainer = ContrastiveTrainer(

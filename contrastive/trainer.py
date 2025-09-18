@@ -11,7 +11,7 @@ import itertools
 
 from core.trainer import AbstractTrainer
 from core.config import CONFIG, device
-from contrastive.model import ContrastiveModel
+from contrastive.model import ContrastiveModel, MemoryOptimizedContrastiveModel
 from contrastive.loss import SupConLoss
 from pytorch_metric_learning.losses import NTXentLoss 
 
@@ -23,7 +23,8 @@ class ContrastiveTrainer(AbstractTrainer):
     该训练器继承自 AbstractTrainer，但重写了其核心训练循环，
     以支持 ContrastiveModel 的多输入和多输出，并使用组合损失函数进行训练。
     """
-    def __init__(self, model: ContrastiveModel, num_epochs: int, learning_rate: float,
+    # def __init__(self, model: ContrastiveModel, num_epochs: int, learning_rate: float,
+    def __init__(self, model: MemoryOptimizedContrastiveModel, num_epochs: int, learning_rate: float,
                  alpha: float,  # <--- 新增参数
                  optimizer_type: str = "AdamW", 
                  gradient_accumulation_steps: int = 4):
@@ -44,14 +45,14 @@ class ContrastiveTrainer(AbstractTrainer):
             # 2. 将参数分组
             # (这会自动处理您之前可能设置的任何 'requires_grad=False' 冻结层)
             backbone_params = itertools.chain(
-                self.model.audio_encoder.parameters(),
-                self.model.text_encoder.parameters()
+                model.audio_encoder.parameters(),
+                model.text_encoder.parameters()
             )
             
             head_params = itertools.chain(
-                self.model.audio_projection_head.parameters(),
-                self.model.text_projection_head.parameters(),
-                self.model.audio_classifier.parameters()
+                model.audio_projection_head.parameters(),
+                model.text_projection_head.parameters(),
+                model.audio_classifier.parameters()
             )
             
             # 3. 创建参数组列表
@@ -60,9 +61,9 @@ class ContrastiveTrainer(AbstractTrainer):
                 {"params": head_params, "lr": head_lr}
             ]
 
-            optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=CONFIG.weight_decay())
+            optimizer = torch.optim.AdamW(optimizer_parameters, lr=learning_rate, weight_decay=CONFIG.weight_decay())
         else: # 默认为 Adam
-            optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=CONFIG.weight_decay())
+            optimizer = torch.optim.Adam(optimizer_parameters, lr=learning_rate, weight_decay=CONFIG.weight_decay())
 
         # 实例化两个损失函数：监督对比损失L_LGCA 和 交叉熵损失L_SER
         self.sup_con_loss = SupConLoss(temperature=0.1)

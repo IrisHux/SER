@@ -51,7 +51,7 @@ class PlotVisualizer:
             plt.show()
         else:
             plt.savefig(os.path.join(CONFIG.save_plots_location(), filename))
-        plt.close()
+        # plt.close()
 
     @classmethod
     def plot_confusion_matrix(

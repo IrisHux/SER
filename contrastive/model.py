@@ -1,3 +1,4 @@
+# contrastive/model.py
 import os
 import safetensors
 import torch
@@ -36,17 +37,17 @@ def setup_memory_optimization():
 # 2. 内存优化的模型配置
 # ===============================
 class MemoryOptimizedContrastiveModel(nn.Module):
-    def __init__(self, num_labels: int, use_gradient_checkpointing: bool = True):
+    def __init__(self, num_labels: int):
         super().__init__()
 
         # 使用更小的模型或者冻结部分层
         self.audio_encoder = WavLMModel.from_pretrained(
-            "microsoft/wavlm-base",
-            torch_dtype=torch.float16 , use_safetensors = True # 使用半精度
+            CONFIG.audio_encoder_name(),
+            use_safetensors = True # 使用半精度
         )
         self.text_encoder = AutoModel.from_pretrained(
-            "microsoft/deberta-v3-base",
-            torch_dtype=torch.float16, use_safetensors = True
+            CONFIG.text_encoder_name(),
+            use_safetensors = True
         )
 
         # 启用梯度检查点以节省内存
@@ -54,44 +55,63 @@ class MemoryOptimizedContrastiveModel(nn.Module):
         #     self.audio_encoder.gradient_checkpointing_enable()
         #     self.text_encoder.gradient_checkpointing_enable()
 
-        # 冻结编码器的前几层以节省内存
-        self._freeze_early_layers()
+        # 冻结部分编码器层以减少训练时的计算量和内存占用
+        # 这里我们冻结 WavLM 的 CNN 特征提取器和 DeBERTa 的前6层 Transformer 层
+        self._freeze_model_parts(num_text_layers_to_freeze=6)
 
         audio_hidden_size = self.audio_encoder.config.hidden_size
         text_hidden_size = self.text_encoder.config.hidden_size
 
-        # 使用更小的投影维度
-        projection_dim = 256  # 从512降到256
+        # --- 2. 为每个模态定义投影头 (Projection Head) ---
+        # 投影头是一个简单的多层感知机 (MLP)，它将编码器输出的高维特征，
+        # 映射到一个统一的、较低维度的嵌入空间，用于计算对比损失。
+        # 投影头的维度配置从 config.yaml 文件中读取。
+        proj_config = CONFIG.projection_bridge_config()
+        projection_dims = proj_config['hidden_dims']
 
         self.audio_projection_head = nn.Sequential(
-            nn.Linear(audio_hidden_size, projection_dim),
+            nn.Linear(audio_hidden_size, projection_dims[0]),
             nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(projection_dim, 128)  # 最终维度也减小
+            nn.Linear(projection_dims[0], projection_dims[1])
         )
 
         self.text_projection_head = nn.Sequential(
-            nn.Linear(text_hidden_size, projection_dim),
+            nn.Linear(text_hidden_size, projection_dims[0]),
             nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(projection_dim, 128)
+            nn.Linear(projection_dims[0], projection_dims[1])
         )
 
         self.audio_classifier = nn.Linear(audio_hidden_size, num_labels)
 
-    def _freeze_early_layers(self):
-        """冻结编码器的前几层"""
-        # 冻结音频编码器的前6层
-        for i, layer in enumerate(self.audio_encoder.encoder.layers):
-            if i < 6:  # 只训练后6层
+    def _freeze_model_parts(self, num_text_layers_to_freeze: int):
+        """
+        冻结编码器的特定部分。
+        """
+        # --- 1. 冻结 WavLM 的 CNN 特征提取器 ---
+        print("--- 正在冻结 WavLM 的 CNN Feature Extractor ---")
+        for param in self.audio_encoder.feature_extractor.parameters():
+            param.requires_grad = False
+
+        # --- 2. 冻结 DeBERTa 的 Embedding 层 ---
+        print("--- 正在冻结 DeBERTa 的 Embeddings ---")
+        for param in self.text_encoder.embeddings.parameters():
+            param.requires_grad = False
+
+        # --- 3. 冻结 DeBERTa 的底层 Transformer ---
+        print(f"--- 正在冻结 DeBERTa 的 Encoder 前 {num_text_layers_to_freeze} 层 ---")
+        total_layers = len(self.text_encoder.encoder.layer)
+        layers_to_freeze = min(num_text_layers_to_freeze, total_layers)
+
+        if layers_to_freeze < num_text_layers_to_freeze:
+                print(f"[警告] 想要冻结 {num_text_layers_to_freeze} 层, "
+                      f"但模型只有 {total_layers} 层。将只冻结 {layers_to_freeze} 层。")
+
+        for i, layer in enumerate(self.text_encoder.encoder.layer):
+            if i < layers_to_freeze:
                 for param in layer.parameters():
                     param.requires_grad = False
 
-        # 冻结文本编码器的前6层
-        for i, layer in enumerate(self.text_encoder.encoder.layer):
-            if i < 6:
-                for param in layer.parameters():
-                    param.requires_grad = False
+        print("--- 编码器冻结操作完成 ---")
 
     def forward(self, audio_input_values, text_input_ids, text_attention_mask):
         # 使用半精度计算
@@ -102,15 +122,17 @@ class MemoryOptimizedContrastiveModel(nn.Module):
             acoustic_features = torch.mean(audio_outputs.last_hidden_state, dim=1)
 
             # 文本分支
-            text_outputs = self.text_encoder(
-                input_ids=text_input_ids,
-                attention_mask=text_attention_mask
-            )
-            text_features = torch.mean(text_outputs.last_hidden_state, dim=1)
+            text_embedding = None
+            if text_input_ids is not None:
+                text_outputs = self.text_encoder(
+                    input_ids=text_input_ids,
+                    attention_mask=text_attention_mask
+                )
+                text_features = torch.mean(text_outputs.last_hidden_state, dim=1)
+                text_embedding = self.text_projection_head(text_features.float())
 
             # 投影和分类
             acoustic_embedding = self.audio_projection_head(acoustic_features.float())
-            text_embedding = self.text_projection_head(text_features.float())
             audio_logits = self.audio_classifier(acoustic_features.float())
 
         return acoustic_embedding, text_embedding, audio_logits
