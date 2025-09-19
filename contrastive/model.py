@@ -50,14 +50,15 @@ class MemoryOptimizedContrastiveModel(nn.Module):
             use_safetensors = True
         )
 
-        # 启用梯度检查点以节省内存
-        # if use_gradient_checkpointing:
-        #     self.audio_encoder.gradient_checkpointing_enable()
-        #     self.text_encoder.gradient_checkpointing_enable()
-
         # 冻结部分编码器层以减少训练时的计算量和内存占用
         # 这里我们冻结 WavLM 的 CNN 特征提取器和 DeBERTa 的前6层 Transformer 层
         self._freeze_model_parts(num_text_layers_to_freeze=6)
+
+        # # 启用梯度检查点以节省内存
+        # if use_gradient_checkpointing:
+        #     self.audio_encoder.gradient_checkpointing_enable()
+        #     self.text_encoder.gradient_checkpointing_enable()
+        #     print("已启用梯度检查点以节省内存")
 
         audio_hidden_size = self.audio_encoder.config.hidden_size
         text_hidden_size = self.text_encoder.config.hidden_size
@@ -129,11 +130,11 @@ class MemoryOptimizedContrastiveModel(nn.Module):
                     attention_mask=text_attention_mask
                 )
                 text_features = torch.mean(text_outputs.last_hidden_state, dim=1)
-                text_embedding = self.text_projection_head(text_features.float())
+                text_embedding = self.text_projection_head(text_features)
 
             # 投影和分类
-            acoustic_embedding = self.audio_projection_head(acoustic_features.float())
-            audio_logits = self.audio_classifier(acoustic_features.float())
+            acoustic_embedding = self.audio_projection_head(acoustic_features)
+            audio_logits = self.audio_classifier(acoustic_features)
 
         return acoustic_embedding, text_embedding, audio_logits
 

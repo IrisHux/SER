@@ -92,7 +92,7 @@ class ContrastiveTrainer(AbstractTrainer):
         #     print("[INFO] WavLM 特征提取层已冻结。")
 
         self.gradient_accumulation_steps = gradient_accumulation_steps
-        self.scaler = torch.amp.GradScaler('cuda') # 用于混合精度训练
+        self.scaler = torch.amp.GradScaler(enabled=True) # 用于混合精度训练
         print(f"[INFO] 使用梯度累积步数: {gradient_accumulation_steps}, 损失权重 alpha: {self.alpha}")
 
     def _get_outputs_and_labels(self, batch: dict):
