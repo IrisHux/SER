@@ -43,7 +43,7 @@ class MemoryOptimizedContrastiveModel(nn.Module):
         # 使用更小的模型或者冻结部分层
         self.audio_encoder = WavLMModel.from_pretrained(
             CONFIG.audio_encoder_name(),
-            use_safetensors = True # 使用半精度
+            use_safetensors = True
         )
         self.text_encoder = AutoModel.from_pretrained(
             CONFIG.text_encoder_name(),

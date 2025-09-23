@@ -33,7 +33,7 @@ class ContrastiveDataCollator:
             return_tensors="pt",
             padding=True,
             truncation=True,
-            max_length=16000 * 15 # 限制最大长度为15秒
+            max_length=16000 * 6 # 限制最大长度为6秒
         )
 
         # 4. 实时处理文本
@@ -42,7 +42,7 @@ class ContrastiveDataCollator:
             return_tensors="pt",
             padding=True,
             truncation=True,
-            max_length=512 # 设定一个合理的文本最大长度
+            max_length=64 # 设定一个合理的文本最大长度
         )
 
         # 5. 将标签列表转换为张量

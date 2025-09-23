@@ -35,7 +35,7 @@ class AudioDataCollator:
             return_tensors="pt",
             padding=True,
             truncation=True,
-            max_length=16000 * 15 # 限制最大长度为15秒，防止OOM
+            max_length=16000 * 6 # 限制最大长度为6秒，防止OOM
         )
 
         # 4. 将标签列表转换为张量
