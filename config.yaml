@@ -44,7 +44,7 @@ training:
   weight_decay: 0.01
   optimizer: "AdamW"
   loss_weights:
-    alpha: 4.0 # 经过验证的最优值
+    alpha: 1.0 # 经过验证的最优值
     # LLGCA loss 的权重 (α)
 
 plots:

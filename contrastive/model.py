@@ -33,6 +33,7 @@ def setup_memory_optimization():
     print(f"GPU总内存: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
     print("内存优化设置完成")
 
+
 # ===============================
 # 2. 内存优化的模型配置
 # ===============================
@@ -114,6 +115,11 @@ class MemoryOptimizedContrastiveModel(nn.Module):
 
         print("--- 编码器冻结操作完成 ---")
 
+    def masked_mean(self, tensor, mask):
+        # x: [B, L, D], mask: [B, L]
+        mask = mask.unsqueeze(-1).type_as(tensor)
+        return (tensor * mask).sum(1) / mask.sum(1).clamp_min(1e-6)
+
     def forward(self, audio_input_values, text_input_ids, text_attention_mask):
         # 使用半精度计算
         with torch.amp.autocast('cuda'):
@@ -129,7 +135,8 @@ class MemoryOptimizedContrastiveModel(nn.Module):
                     input_ids=text_input_ids,
                     attention_mask=text_attention_mask
                 )
-                text_features = torch.mean(text_outputs.last_hidden_state, dim=1)
+                text_features = self.masked_mean(text_outputs.last_hidden_state, text_attention_mask)
+                # text_features = torch.mean(text_outputs.last_hidden_state, dim=1)
                 text_embedding = self.text_projection_head(text_features)
 
             # 投影和分类
