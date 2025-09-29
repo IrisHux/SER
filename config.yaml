@@ -38,7 +38,7 @@ models:
     hidden_dims: [512, 256] # 隐藏层维度 (可以根据需要调整)
 
 training:
-  epochs: 15
+  epochs: 20
   learning_rate: 0.00005
   head_lr: 0.001
   weight_decay: 0.01

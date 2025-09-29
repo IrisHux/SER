@@ -228,6 +228,7 @@ class ContrastiveTrainer(AbstractTrainer):
             if val_dataloader:
                 self.model.eval()
                 epoch_val_losses, epoch_val_accuracies = [], []
+                all_preds, all_labels = [], []  # 收集所有预测和标签用于计算UAR
                 val_loader = tqdm.tqdm(val_dataloader, desc=f"Epoch {epoch} [验证中]")
                 with torch.no_grad():
                     for batch in val_loader:
@@ -237,30 +238,40 @@ class ContrastiveTrainer(AbstractTrainer):
 
                         # **使用单模态方法，只获取logits和真实标签**
                         logits, labels = self._get_logits_and_real(batch)
-                        
-                        # with torch.amp.autocast('cuda'):
-                        #     loss_sup_con = self.sup_con_loss(acoustic_embedding, text_embedding, labels)
-                        #     loss_ce = self.cross_entropy_loss(audio_logits, labels)
-                        #     val_loss = self.alpha * loss_sup_con + loss_ce
-
-                        # preds = torch.argmax(audio_logits, dim=1)
-                        # val_accuracy = (preds == labels).float().mean()
 
                         # **只计算交叉熵损失，因为它直接反映分类性能**
                         val_loss = self.cross_entropy_loss(logits, labels)
-                        val_accuracy = (torch.argmax(logits, dim=1) == labels).float().mean()
+                        preds = torch.argmax(logits, dim=1)
+                        val_accuracy = (preds == labels).float().mean()
                         
                         epoch_val_losses.append(val_loss.item())
                         epoch_val_accuracies.append(val_accuracy.item())
 
-                # 计算并存储该epoch的平均验证指标
+                        # 收集预测和标签
+                        all_preds.extend(preds.cpu().numpy())
+                        all_labels.extend(labels.cpu().numpy())
 
+                # 计算并存储该epoch的平均验证指标
                 history_val_loss.append(np.mean(epoch_val_losses))
                 history_val_acc.append(np.mean(epoch_val_accuracies))
                 
-                logger.info(f"Epoch {epoch} 总结: 训练损失: {history_train_loss[-1]:.4f}, 训练准确率: {history_train_acc[-1]:.4f}, "
-                            f"验证损失: {np.mean(epoch_val_losses):.4f}, 验证准确率: {np.mean(epoch_val_accuracies):.4f}")
+                # 计算UAR (非加权平均召回率)
+                from sklearn.metrics import recall_score
+                val_uar = recall_score(all_labels, all_preds, average='macro')
                 
+                logger.info(f"Epoch {epoch} 总结: 训练损失: {history_train_loss[-1]:.4f}, 训练准确率: {history_train_acc[-1]:.4f}, "
+                            f"验证损失: {np.mean(epoch_val_losses):.4f}, 验证准确率: {np.mean(epoch_val_accuracies):.4f}, "
+                            f"验证UAR: {val_uar:.4f}")
+                
+                # 保存最佳UAR模型
+                if epoch >= 12:  # 只在第12个epoch后开始考虑保存模型
+                    if not hasattr(self, 'best_uar') or val_uar > self.best_uar:
+                        self.best_uar = val_uar
+                        # 确保保存目录存在
+                        os.makedirs('exp', exist_ok=True)
+                        torch.save(self.model.state_dict(), f'exp/best_uar_model_epoch_{epoch}.pt')
+                        logger.info(f"新的最佳UAR模型已保存: {val_uar:.4f} (Epoch {epoch})")
+
         # print("total_loss = loss_sup_con")
         # print("total_loss = loss_ce")
         # 所有epoch结束后，绘制训练曲线
