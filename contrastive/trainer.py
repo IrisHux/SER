@@ -11,7 +11,7 @@ import itertools
 
 from core.trainer import AbstractTrainer
 from core.config import CONFIG, device
-from contrastive.model import ContrastiveModel, MemoryOptimizedContrastiveModel
+from contrastive.model import ContrastiveModel, MemoryOptimizedContrastiveModel, AcousticSupConModel
 from contrastive.loss import SupConLoss
 from pytorch_metric_learning.losses import NTXentLoss 
 
@@ -419,3 +419,236 @@ class AblationTrainer(ContrastiveTrainer):
         print(f"消融模型 {self.name} 训练完成。")
         self.plot_histories(history_train_loss, history_train_acc, history_val_loss, history_val_acc)
         # self.plot_histories(history_loss, history_acc)
+
+
+class AblationNoTextTrainer(ContrastiveTrainer):
+    """
+    [已修正] 消融模型B (LGCA w/o Text Anchor) 的专用训练器。
+
+    修正内容:
+    - 重写了 __init__ 方法，为纯声学模型定制了优化器参数分组，
+      解决了因调用父类__init__而导致的 AttributeError。
+    """
+
+    # 步骤 1: [核心修正] 为子类重写 __init__ 方法
+    def __init__(self, model: AcousticSupConModel, num_epochs: int, learning_rate: float,
+                 alpha: float, optimizer_type: str = "AdamW",
+                 gradient_accumulation_steps: int = 4):
+
+        # --- 1. 为纯声学模型定制优化器参数分组 ---
+        # 这里的逻辑与父类相似，但移除了所有与 text_encoder 相关的部分
+        if optimizer_type.lower() == "adamw":
+            head_lr = CONFIG.training_head_lr()
+            print(f"--- [消融优化器配置] Backbone LR: {learning_rate}, Head LR: {head_lr} ---")
+
+            # `backbone` 只包含 audio_encoder
+            backbone_params = model.audio_encoder.parameters()
+
+            # `head` 只包含 audio_projection_head 和 audio_classifier
+            head_params = itertools.chain(
+                model.audio_projection_head.parameters(),
+                model.audio_classifier.parameters()
+            )
+
+            optimizer_parameters = [
+                {"params": backbone_params, "lr": learning_rate},
+                {"params": head_params, "lr": head_lr}
+            ]
+            optimizer = torch.optim.AdamW(optimizer_parameters, lr=learning_rate, weight_decay=CONFIG.weight_decay())
+        else:
+            # 为其他优化器类型提供一个简单的（非差分学习率）备用方案
+            optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=CONFIG.weight_decay())
+
+        # --- 2. 初始化损失函数 (这部分逻辑与父类相同) ---
+        self.sup_con_loss = SupConLoss(temperature=0.1)
+        self.cross_entropy_loss = nn.CrossEntropyLoss()
+        self.alpha = alpha
+
+        # --- 3. 调用 *祖父类* (AbstractTrainer) 的 __init__ ---
+        # 我们需要手动完成父类 `ContrastiveTrainer` 本来会做的所有初始化工作。
+        # 注意这里我们不再调用 super().__init__(...)，因为它会指向有问题的父类方法。
+        # 我们直接调用 `AbstractTrainer` 的构造函数。
+        # (假设你的 AbstractTrainer 的 __init__ 签名是这样的)
+        super(ContrastiveTrainer, self).__init__(
+            model=model,
+            num_epochs=num_epochs,
+            optimizer=optimizer,
+            loss=None,  # 我们手动计算组合损失
+            name="Ablation_LGCA_no_Text",
+            alpha=self.alpha # 如果 AbstractTrainer 接收这个参数
+        )
+
+        # --- 4. 初始化训练器状态 (这部分逻辑也来自父类) ---
+        self.gradient_accumulation_steps = gradient_accumulation_steps
+        self.scaler = torch.amp.GradScaler(enabled=True)
+        print(f"[INFO] 初始化 {self._name} 训练器完成。梯度累积: {gradient_accumulation_steps}, Alpha: {self.alpha}")
+
+    # _get_outputs_and_labels, _get_logits_and_real, train 方法保持不变...
+    # (这里省略之前已经提供的其他方法代码，它们是正确的，无需修改)
+    def _get_outputs_and_labels(self, batch: dict):
+        """
+        [核心修改] 重写此辅助方法，以处理新的双音频输入批次。
+        这个方法是连接 Dataloader 和 Model 的关键桥梁。
+        """
+        # 从批次中解包两个增强后的音频视图和标签
+        audio_inputs_1 = batch['audio_input_1'].to(device, non_blocking=True)
+        audio_inputs_2 = batch['audio_input_2'].to(device, non_blocking=True)
+        labels = batch['labels'].to(device, non_blocking=True)
+
+        # 使用混合精度进行前向传播
+        # self.model 在这里是 AcousticSupConModel 的一个实例
+        with torch.amp.autocast('cuda'):
+            embedding_1, embedding_2, audio_logits = self.model(
+                audio_input_1=audio_inputs_1,
+                audio_input_2=audio_inputs_2
+            )
+
+        return embedding_1, embedding_2, audio_logits, labels
+
+    # 步骤 3: 重写验证阶段的"桥梁"方法，以适配纯声学模型
+    def _get_logits_and_real(self, batch: dict) -> (torch.Tensor, torch.Tensor):
+        """
+        [核心修改] 为评估阶段重写此方法。
+        该方法遵循“测试时单模态”的原则。
+        """
+        # 1. 从批次中解包 *两个* 音频输入和真实标签
+        audio_inputs_1 = batch['audio_input_1'].to(device, non_blocking=True)
+        audio_inputs_2 = batch['audio_input_2'].to(device, non_blocking=True)
+        labels = batch['labels'].to(device, non_blocking=True)
+
+        # 2. 模型前向传播（只获取 audio_logits）
+        #    我们调用模型，但只关心第三个返回值。
+        #    AcousticSupConModel 的 forward 方法设计为用第一个输入计算 logits。
+        _, _, audio_logits = self.model(
+            audio_input_1=audio_inputs_1,
+            audio_input_2=audio_inputs_2
+        )
+
+        # 3. 返回 eval 方法期望的两个值
+        return audio_logits, labels
+
+    def train(self, train_dataloader, val_dataloader=None):
+        """
+        [核心修改] 重写核心训练方法，以适配新的损失计算逻辑。
+        大部分代码结构与父类 `ContrastiveTrainer.train` 相同。
+        """
+        # --- 初始化 (完全复用父类逻辑) ---
+        total_steps = len(train_dataloader) // self.gradient_accumulation_steps * self._num_epochs
+        total_steps = max(1, total_steps)
+        scheduler = transformers.get_linear_schedule_with_warmup(
+            self._optimizer, num_warmup_steps=0, num_training_steps=total_steps
+        )
+        history_train_loss, history_train_acc = [], []
+        history_val_loss, history_val_acc = [], []
+        logger.info(f"开始训练 {self._name} (Ablation w/o Text) 模型...")
+
+        # --- 训练循环 ---
+        for epoch in range(1, self._num_epochs + 1):
+            self.model.train()
+            epoch_train_losses, epoch_train_accuracies = [], []
+            loader = tqdm.tqdm(train_dataloader, desc=f"Epoch {epoch} [训练中 - No Text Ablation]")
+
+            for step, batch in enumerate(loader):
+                try:
+                    # 1. 前向传播: 调用我们重写过的 _get_outputs_and_labels
+                    embedding_1, embedding_2, audio_logits, labels = self._get_outputs_and_labels(batch)
+
+                    with torch.amp.autocast('cuda'):
+                        # 2. 计算损失 [逻辑修改点]
+                        #    将两个声学嵌入送入 SupConLoss
+                        loss_sup_con = self.sup_con_loss(embedding_1, embedding_2, labels)
+
+                        #    交叉熵损失计算方式不变
+                        loss_ce = self.cross_entropy_loss(audio_logits, labels)
+
+                        #    组合损失公式不变
+                        total_loss = self.alpha * loss_sup_con + loss_ce
+
+                        scaled_loss = total_loss / self.gradient_accumulation_steps
+
+                    # 3. 反向传播与优化 (完全复用父类逻辑)
+                    self.scaler.scale(scaled_loss).backward()
+
+                    with torch.no_grad():
+                        accuracy = (torch.argmax(audio_logits, dim=1) == labels).float().mean()
+
+                    epoch_train_losses.append(total_loss.item())
+                    epoch_train_accuracies.append(accuracy.item())
+
+                    if (step + 1) % self.gradient_accumulation_steps == 0:
+                        self.scaler.unscale_(self._optimizer)
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                        self.scaler.step(self._optimizer)
+                        self.scaler.update()
+                        scheduler.step()
+                        self._optimizer.zero_grad()
+                        loader.set_postfix(loss=total_loss.item(), acc=accuracy.item(),
+                                           sup_con=loss_sup_con.item(), ce=loss_ce.item())
+
+                    if step % 20 == 0:
+                        gc.collect()
+                        torch.cuda.empty_cache()
+
+                except Exception as e:
+                    tqdm.tqdm.write(f"训练步骤 {step} 出错: {e}")
+                    gc.collect()
+                    torch.cuda.empty_cache()
+
+            # --- 记录训练历史 (完全复用父类逻辑) ---
+            history_train_loss.append(np.mean(epoch_train_losses))
+            history_train_acc.append(np.mean(epoch_train_accuracies))
+
+            # --- 验证循环 (完全复用父类逻辑) ---
+            if val_dataloader:
+                self.model.eval() # 1. 设置为评估模式
+                epoch_val_losses, epoch_val_accuracies = [], []
+                all_preds, all_labels = [], [] # 用于计算UAR
+
+                # 2. 在 no_grad 上下文中进行
+                with torch.no_grad():
+                    val_loader = tqdm.tqdm(val_dataloader, desc=f"Epoch {epoch} [验证中]")
+                    for batch in val_loader:
+                        if not batch: continue
+
+                        # 3. 获取模型输出
+                        #    注意：这里我们只关心分类性能，所以使用 _get_logits_and_real
+                        logits, labels = self._get_logits_and_real(batch)
+
+                        # 4. 计算验证损失
+                        #    在验证时，只关心分类损失 (CrossEntropy)
+                        val_loss = self.cross_entropy_loss(logits, labels)
+
+                        # 5. 计算预测和准确率
+                        preds = torch.argmax(logits, dim=1)
+                        val_accuracy = (preds == labels).float().mean()
+
+                        # 6. 收集数据用于后续指标计算
+                        epoch_val_losses.append(val_loss.item())
+                        epoch_val_accuracies.append(val_accuracy.item())
+                        all_preds.extend(preds.cpu().numpy())
+                        all_labels.extend(labels.cpu().numpy())
+
+                # 7. 计算并记录整个 epoch 的平均指标
+                avg_val_loss = np.mean(epoch_val_losses)
+                avg_val_acc = np.mean(epoch_val_accuracies)
+                # UAR 是基于整个验证集的所有预测来计算的
+                from sklearn.metrics import recall_score
+                val_uar = recall_score(all_labels, all_preds, average='macro', zero_division=0)
+
+                history_val_loss.append(avg_val_loss)
+                history_val_acc.append(avg_val_acc)
+
+                logger.info(f"Epoch {epoch} 总结: Train Loss: {history_train_loss[-1]:.4f}, Train Acc: {history_train_acc[-1]:.4f}, "
+                            f"Val Loss: {avg_val_loss:.4f}, Val Acc: {avg_val_acc:.4f}, Val UAR: {val_uar:.4f}")
+
+                # 保存最佳模型 (逻辑复用)
+                if epoch >= 12:
+                    if not hasattr(self, 'best_uar') or val_uar > self.best_uar:
+                        self.best_uar = val_uar
+                        os.makedirs('exp', exist_ok=True)
+                        save_path = f'exp/ablation_no_text_best_uar_model_epoch_{epoch}.pt'
+                        torch.save(self.model.state_dict(), save_path)
+                        logger.info(f"新的最佳UAR模型已保存: {val_uar:.4f} (Epoch {epoch}) -> {save_path}")
+
+        # --- 绘图 (完全复用父类逻辑) ---
+        self.plot_histories(history_train_loss, history_train_acc, history_val_loss, history_val_acc)

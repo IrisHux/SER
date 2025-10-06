@@ -82,3 +82,70 @@ class EmotionDataset(Dataset):
 
     def __len__(self):
         return len(self.dataframe)
+    
+class EmotionDatasetAblation(EmotionDataset):
+    """
+    [消融实验B] 的数据集：继承自 EmotionDataset，但重写了 __getitem__ 方法。
+    - 目标：为纯声学对比学习生成两个不同的音频增强视图。
+    - 复用：完全复用父类的 __init__ 方法，无需重写。
+    """
+    def __init__(self, dataframe: pd.DataFrame, dataset_name: str, emotions: list, split: str):
+        # 1. 调用父类的 __init__，完美复用所有数据加载和划分逻辑
+        super().__init__(dataframe, dataset_name, emotions, split)
+
+        # 2. 定义两种不同的数据增强流程
+        #    p=0.5 表示有50%的概率应用该增强
+        self.augment_v1 = Compose([
+            AddGaussianNoise(min_amplitude=0.001, max_amplitude=0.015, p=0.5),
+            PitchShift(min_semitones=-2, max_semitones=2, p=0.5)
+        ])
+
+        self.augment_v2 = Compose([
+            TimeStretch(min_rate=0.8, max_rate=1.25, p=0.5),
+            # 确保两种增强流程不完全相同
+            AddGaussianNoise(min_amplitude=0.001, max_amplitude=0.010, p=0.5),
+        ])
+
+        logger.info(f"EmotionDatasetAblation 初始化完成，已配置音频数据增强。")
+
+    def __getitem__(self, index: int):
+        # 1. 获取音频路径和标签 (这部分逻辑与父类相同)
+        row = self.dataframe.loc[index]
+        audio_path = row['audio_path']
+        emotion_label = row['emotion']
+        emotion_index = torch.tensor(np.where(self._emotions == emotion_label)[0][0])
+
+        # 2. 加载和预处理原始音频 (这部分逻辑也与父类相同)
+        try:
+            waveform, sample_rate = torchaudio.load(audio_path)
+
+            if sample_rate != 16000:
+                resampler = torchaudio.transforms.Resample(orig_freq=sample_rate, new_freq=16000)
+                waveform = resampler(waveform)
+
+            if waveform.shape[0] > 1:
+                waveform = torch.mean(waveform, dim=0, keepdim=True)
+
+            # *** 核心修改点：应用数据增强 ***
+            # 将 PyTorch 张量 (C, T) -> (T,) -> NumPy 数组，以用于增强
+            waveform_np = waveform.squeeze().numpy()
+
+            # 应用两种不同的增强
+            augmented_waveform_1 = self.augment_v1(samples=waveform_np, sample_rate=16000)
+            augmented_waveform_2 = self.augment_v2(samples=waveform_np, sample_rate=16000)
+
+            # 将增强后的 NumPy 数组转回 PyTorch 张量
+            waveform_1_tensor = torch.from_numpy(augmented_waveform_1)
+            waveform_2_tensor = torch.from_numpy(augmented_waveform_2)
+
+            # *** 核心修改点：返回值的结构改变 ***
+            # 不再返回 "text"，而是返回两个增强后的 "waveform"
+            return {
+                "waveform_1": waveform_1_tensor,
+                "waveform_2": waveform_2_tensor,
+                "label": emotion_index
+            }
+
+        except Exception as e:
+            logger.error(f"为消融实验加载或增强音频 {audio_path} 时出错: {e}")
+            return None

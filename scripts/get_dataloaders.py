@@ -8,9 +8,9 @@ from torch.utils.data import DataLoader
 from transformers import Wav2Vec2Processor, AutoProcessor, Wav2Vec2FeatureExtractor, AutoTokenizer # 导入 AutoProcessor
 from typing import Dict  # 需要添加这个导入
 
-from core.config import CONFIG # 保持不变
-from dataloaders.dataset import EmotionDataset # 导入新的Dataset
-from dataloaders.collator import AudioDataCollator # 导入新的Collator
+from core.config import CONFIG
+from dataloaders.dataset import EmotionDataset, EmotionDatasetAblation
+from dataloaders.collator import AudioDataCollator, AblationCollator
 from contrastive.collator import ContrastiveDataCollator
 
 def get_contrastive_dataloaders(dataset_name: str) -> Dict[str, torch.utils.data.DataLoader]:
@@ -60,6 +60,63 @@ def get_contrastive_dataloaders(dataset_name: str) -> Dict[str, torch.utils.data
         )
 
     return dataloaders
+
+
+def get_ablation_no_text_dataloaders(dataset_name: str) -> Dict[str, torch.utils.data.DataLoader]:
+    """
+    [消融实验B: w/o Text Anchor] 的专用 Dataloader 创建函数。
+
+    该函数构建了一个完全独立的、用于纯声学监督对比学习的数据管道：
+    1. 使用 `EmotionDatasetAblation` 来加载音频并应用两种不同的数据增强。
+    2. 使用 `AblationCollator` 来分别处理这两个增强后的音频视图。
+    """
+    print(f"--- [消融实验] 正在为 '{dataset_name}' 准备纯声学对比学习 Dataloaders ---")
+
+    # 步骤 1: 加载数据集的基础信息 (这部分与原函数完全相同，直接复用)
+    emotions = CONFIG.dataset_emotions(dataset_name)
+    dataloader_params = CONFIG.dataloader_dict()
+    preprocessed_dir = CONFIG.dataset_preprocessed_dir_path(dataset_name)
+    base_name = dataset_name.split('_')[0].lower()
+    raw_df_path = os.path.join(preprocessed_dir, f"{base_name}_raw.pkl")
+
+    try:
+        dataframe = pd.read_pickle(raw_df_path)
+        print(f"[INFO] 已从 {raw_df_path} 加载原始数据信息。")
+    except FileNotFoundError as e:
+        print(f"[ERROR] 找不到文件 {raw_df_path}。")
+        raise e
+
+    # 步骤 2: 初始化音频处理器 (Collator 需要它)
+    # 只需要音频的 Feature Extractor，不需要文本的 Tokenizer
+    audio_processor = Wav2Vec2FeatureExtractor.from_pretrained(CONFIG.audio_encoder_name())
+    print("[INFO] 音频特征提取器初始化完成。")
+
+    # 步骤 3: 实例化新的、为消融实验设计的 Collator
+    ablation_collator = AblationCollator(audio_processor=audio_processor)
+
+    # 步骤 4: 创建 Dataloaders，并确保使用新的 Dataset 和 Collator
+    dataloaders = {}
+    if dataset_name == CONFIG.training_dataset_name():
+        splits = ["train", "validation"]
+    else:
+        # 消融实验通常也需要在评估集上测试，所以保留 evaluation
+        splits = ["evaluation"]
+
+    for split in splits:
+        # *** 核心修改点：实例化 EmotionDatasetAblation ***
+        dataset = EmotionDatasetAblation(dataframe, dataset_name, emotions, split)
+
+        dataloaders[split] = DataLoader(
+            dataset,
+            # *** 核心修改点：使用 ablation_collator ***
+            collate_fn=ablation_collator,
+            **dataloader_params
+        )
+        print(f"[INFO] 已为 '{split}' 划分创建 Dataloader (使用 EmotionDatasetAblation 和 AblationCollator)。")
+
+    return dataloaders
+
+
 # 修改函数，使其适应新的流程
 def get_dataloaders(dataset_name: str) -> Dict[str, DataLoader]:
     print(f"--- 正在为数据集 '{dataset_name}' 准备Dataloaders (实时处理模式) ---")

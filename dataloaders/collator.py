@@ -46,3 +46,53 @@ class AudioDataCollator:
             "audio_input_values": inputs.input_values,
             "labels": labels_batch
         }
+
+
+class AblationCollator:
+    """
+    [消融实验B] 的数据整理器。
+    - 接收一个包含 'waveform_1' 和 'waveform_2' 的批次。
+    - 分别对这两个波形列表进行实时处理和填充。
+    """
+    def __init__(self, audio_processor: Wav2Vec2FeatureExtractor):
+        self.audio_processor = audio_processor
+
+    def __call__(self, batch: List[Dict]) -> Dict[str, torch.Tensor]:
+        # 1. 过滤掉加载失败的样本
+        batch = [item for item in batch if item is not None]
+        if not batch:
+            return {}
+
+        # 2. 分别提取两个波形视图和标签的列表
+        waveforms_1 = [item["waveform_1"].numpy() for item in batch]
+        waveforms_2 = [item["waveform_2"].numpy() for item in batch]
+        labels = [item["label"] for item in batch]
+
+        # 3. 分别处理两个波形列表
+        audio_inputs_1 = self.audio_processor(
+            waveforms_1,
+            sampling_rate=16000,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=16000 * 6
+        )
+
+        audio_inputs_2 = self.audio_processor(
+            waveforms_2,
+            sampling_rate=16000,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=16000 * 6
+        )
+
+        # 4. 将标签列表转换为张量
+        labels_batch = torch.stack(labels)
+
+        # 5. 组合成最终的模型输入字典
+        return {
+            "audio_input_1": audio_inputs_1.input_values,
+            "audio_input_2": audio_inputs_2.input_values,
+            "labels": labels_batch
+        }

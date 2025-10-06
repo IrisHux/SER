@@ -282,3 +282,57 @@ class ContrastiveModel(nn.Module):
         audio_logits = self.audio_classifier(acoustic_features)
 
         return acoustic_embedding, text_embedding, audio_logits
+    
+
+class AcousticSupConModel(nn.Module):
+    """
+    消融模型B: LGCA w/o Text Anchor
+    一个纯声学的监督对比学习模型。
+    """
+    def __init__(self, num_labels: int):
+        super().__init__()
+
+        # --- 1. 只实例化声学编码器 ---
+        self.audio_encoder = WavLMModel.from_pretrained(
+            CONFIG.audio_encoder_name(),
+            use_safetensors=True
+        )
+
+        # (可选但推荐) 冻结特征提取器
+        if hasattr(self.audio_encoder, 'feature_extractor'):
+            for param in self.audio_encoder.feature_extractor.parameters():
+                param.requires_grad = False
+
+        audio_hidden_size = self.audio_encoder.config.hidden_size
+
+        # --- 2. 只需要一个声学投影头 ---
+        proj_config = CONFIG.projection_bridge_config()
+        projection_dims = proj_config['hidden_dims']
+        self.audio_projection_head = nn.Sequential(
+            nn.Linear(audio_hidden_size, projection_dims[0]),
+            nn.ReLU(),
+            nn.Linear(projection_dims[0], projection_dims[1])
+        )
+
+        # --- 3. 仍然需要分类头 ---
+        self.audio_classifier = nn.Linear(audio_hidden_size, num_labels)
+
+    def forward(self, audio_input_1, audio_input_2):
+        """
+        前向传播接收两个增强版本的音频输入。
+        """
+        # --- 分别处理两个音频输入 ---
+        # 它们共享同一个编码器和投影头
+        outputs_1 = self.audio_encoder(input_values=audio_input_1)
+        features_1 = torch.mean(outputs_1.last_hidden_state, dim=1)
+        embedding_1 = self.audio_projection_head(features_1)
+
+        outputs_2 = self.audio_encoder(input_values=audio_input_2)
+        features_2 = torch.mean(outputs_2.last_hidden_state, dim=1)
+        embedding_2 = self.audio_projection_head(features_2)
+
+        # --- 计算分类 Logits ---
+        # 通常只使用一个视图（例如第一个）的特征来做分类，以保持稳定性
+        logits = self.audio_classifier(features_1)
+
+        return embedding_1, embedding_2, logits
