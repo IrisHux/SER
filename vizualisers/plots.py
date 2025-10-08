@@ -57,9 +57,14 @@ class PlotVisualizer:
     def plot_confusion_matrix(
         cls, confusion_matrix: List[List[int]], labels: List[str], filename: str = None
     ):
+        # 创建混淆矩阵显示对象并绘制
         ConfusionMatrixDisplay(confusion_matrix, display_labels=labels).plot()
+        
+            
         if filename is None:
             plt.show()
         else:
+            plt.title(os.path.splitext(filename)[0].replace('-', ' '), fontsize=14, pad=20)
+            plt.tight_layout()  # 自动调整子图布局
             plt.savefig(os.path.join(CONFIG.save_plots_location(), filename))
         # plt.close()

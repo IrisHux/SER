@@ -22,12 +22,13 @@ dataset_specific:
 
 
 dataloader:
-  batch_size: 16
+  batch_size: 4
   num_workers: 2
 
 models:
   # 模型保存目录，相对于 project_root
   save_location: "saved_models"
+  checkpoints_location: "checkpoints"
   # 音频编码器模型名称 (WavLM-Base+)
   audio_encoder: "microsoft/wavlm-base"
   # 文本编码器模型名称 (DeBERTa-V3-Base)
@@ -38,7 +39,7 @@ models:
     hidden_dims: [512, 256] # 隐藏层维度 (可以根据需要调整)
 
 training:
-  epochs: 20
+  epochs: 3
   learning_rate: 0.00005
   head_lr: 0.001
   weight_decay: 0.01
