@@ -29,6 +29,7 @@ def main():
 
         # 加载 config.yaml 配置文件
         CONFIG.load_config("config.yaml")
+        print(f"base_size := {CONFIG.dataloader_dict()['batch_size']}")
 
         # --- 步骤 1: 确保原始数据信息文件存在 (一次性运行) ---
         print("\n--- [步骤 1] 检查并生成原始数据信息文件 ---")
@@ -75,15 +76,16 @@ def main():
 
         baseline_trainer = MemoryOptimizedAudioBaselineTrainer(
             model=baseline_model,
-            num_epochs=CONFIG.training_epochs(),
-            learning_rate=CONFIG.learning_rate(),
-            optimizer_type=CONFIG.optimizer_type(),
+            num_epochs=10,
+            learning_rate=1e-4,
+            optimizer_type="Adam",
             gradient_accumulation_steps=4
         )
 
         # --- 步骤 4: 训练模型 ---
         print("\n--- [步骤 4] 开始在 IEMOCAP 上训练基线模型 ---")
-        baseline_trainer.train(train_loader)
+        # baseline_trainer.train(train_loader)
+        training_history = baseline_trainer.train(train_loader, validation_loader)
 
         # --- 步骤 5: 在 IEMOCAP 验证集上评估 ---
         print("\n--- [步骤 5] 在 IEMOCAP 验证集上评估模型性能 ---")
