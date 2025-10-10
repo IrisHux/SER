@@ -3,6 +3,7 @@
 import torch
 from transformers import Wav2Vec2Processor, Wav2Vec2FeatureExtractor
 from typing import List, Dict, Tuple
+SECONDES = 2
 
 class AudioDataCollator:
     """
@@ -35,7 +36,7 @@ class AudioDataCollator:
             return_tensors="pt",
             padding=True,
             truncation=True,
-            max_length=16000 * 6 # 限制最大长度为6秒，防止OOM
+            max_length=16000 * SECONDES # 限制最大长度为6秒，防止OOM
         )
 
         # 4. 将标签列表转换为张量
@@ -75,7 +76,7 @@ class AblationCollator:
             return_tensors="pt",
             padding=True,
             truncation=True,
-            max_length=16000 * 6
+            max_length=16000 * SECONDES
         )
 
         audio_inputs_2 = self.audio_processor(
@@ -84,7 +85,7 @@ class AblationCollator:
             return_tensors="pt",
             padding=True,
             truncation=True,
-            max_length=16000 * 6
+            max_length=16000 * SECONDES
         )
 
         # 4. 将标签列表转换为张量

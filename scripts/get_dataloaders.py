@@ -13,12 +13,14 @@ from dataloaders.dataset import EmotionDataset, EmotionDatasetAblation
 from dataloaders.collator import AudioDataCollator, AblationCollator
 from contrastive.collator import ContrastiveDataCollator
 
-def get_contrastive_dataloaders(dataset_name: str) -> Dict[str, torch.utils.data.DataLoader]:
+def get_contrastive_dataloaders(dataset_name: str, use_audio_augmentation: bool = False)  -> Dict[str, torch.utils.data.DataLoader]:
     """
     为对比学习框架获取双模态的 Dataloaders。
     """
     print(f"--- 正在为 '{dataset_name}' 准备双模态 Dataloaders ---")
-
+    if use_audio_augmentation:
+        print("[INFO] 本次将为训练集启用音频数据增强。")
+    # 1. 加载数据集的基础信息
     emotions = CONFIG.dataset_emotions(dataset_name)
     dataloader_params = CONFIG.dataloader_dict()
     preprocessed_dir = CONFIG.dataset_preprocessed_dir_path(dataset_name)
@@ -52,7 +54,13 @@ def get_contrastive_dataloaders(dataset_name: str) -> Dict[str, torch.utils.data
         splits = ["evaluation"]
 
     for split in splits:
-        dataset = EmotionDataset(dataframe, dataset_name, emotions, split)
+        # 仅在训练集上启用数据增强
+        should_augment = (split == "train") and use_audio_augmentation
+ 
+        dataset = EmotionDataset(dataframe, dataset_name, emotions, split, use_audio_augmentation=should_augment)
+        if should_augment:
+            print(f"[INFO] 已为 '{split}' 划分启用数据增强并创建 Dataset。")
+
         dataloaders[split] = DataLoader(
             dataset,
             collate_fn=contrastive_collator, # <-- 使用新的双模态实时处理collator
@@ -91,8 +99,10 @@ def get_ablation_no_text_dataloaders(dataset_name: str) -> Dict[str, torch.utils
     audio_processor = Wav2Vec2FeatureExtractor.from_pretrained(CONFIG.audio_encoder_name())
     print("[INFO] 音频特征提取器初始化完成。")
 
-    # 步骤 3: 实例化新的、为消融实验设计的 Collator
+    # 步骤 3: 实例化两种 Collator
     ablation_collator = AblationCollator(audio_processor=audio_processor)
+    # 这个 collator 用于处理单音频输入的验证/评估集
+    std_audio_collator = AudioDataCollator(processor=audio_processor)
 
     # 步骤 4: 创建 Dataloaders，并确保使用新的 Dataset 和 Collator
     dataloaders = {}
@@ -103,16 +113,23 @@ def get_ablation_no_text_dataloaders(dataset_name: str) -> Dict[str, torch.utils
         splits = ["evaluation"]
 
     for split in splits:
-        # *** 核心修改点：实例化 EmotionDatasetAblation ***
-        dataset = EmotionDatasetAblation(dataframe, dataset_name, emotions, split)
+        # *** 实例化 EmotionDatasetAblation ***
+        if split == "train":
+            dataset = EmotionDatasetAblation(dataframe, dataset_name, emotions, split)
+            collator_to_use = ablation_collator
+            print(f"[INFO] 已为 '{split}' 划分创建 Dataloader (使用 EmotionDatasetAblation 和 AblationCollator)。")
+        else:
+            # 验证集和评估集使用标准的 Dataset 和 Collator
+            # 注意：这里我们复用 EmotionDataset，但需要确保它不返回文本，
+            dataset = EmotionDataset(dataframe, dataset_name, emotions, split)
+            collator_to_use = std_audio_collator
+            print(f"[INFO] 已为 '{split}' 划分创建 Dataloader (使用标准的 EmotionDataset 和 AudioDataCollator)。")
 
         dataloaders[split] = DataLoader(
             dataset,
-            # *** 核心修改点：使用 ablation_collator ***
-            collate_fn=ablation_collator,
+            collate_fn=collator_to_use, # 动态选择collator
             **dataloader_params
         )
-        print(f"[INFO] 已为 '{split}' 划分创建 Dataloader (使用 EmotionDatasetAblation 和 AblationCollator)。")
 
     return dataloaders
 

@@ -71,8 +71,21 @@ def run_hyperparameter_trial(alpha_value: float,
     # 3. 在IEMOCAP验证集上进行评估
     print("在IEMOCAP验证集上进行评估...")
     iemocap_emotions = CONFIG.dataset_emotions(CONFIG.training_dataset_name())
-    # 确保您的 eval 方法返回 uar 和 war
-    val_uar, val_war = trainer.eval(validation_loader, labels=iemocap_emotions)
+    # eval方法返回三个值：uar, war和混淆矩阵
+    eval_results = trainer.eval(validation_loader, labels=iemocap_emotions)
+    
+    # 如果返回的是元组，提取uar和war
+    if isinstance(eval_results, tuple):
+        if len(eval_results) == 2:
+            val_uar, val_war = eval_results
+        elif len(eval_results) >= 3:  # 如果返回三个或更多值
+            val_uar, val_war = eval_results[0], eval_results[1]
+        else:  # 如果只返回一个值，假设是uar
+            val_uar = eval_results[0]
+            val_war = 0.0  # 默认值
+    else:  # 如果不是元组，假设是单个值(uar)
+        val_uar = eval_results
+        val_war = 0.0  # 默认值
 
     # 4. 返回验证集上的UAR和WAR指标
     print(f"试验完成: alpha={alpha_value}, UAR={val_uar:.4f}, WAR={val_war:.4f}")

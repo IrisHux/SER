@@ -120,14 +120,25 @@ class MemoryOptimizedContrastiveModel(nn.Module):
         mask = mask.unsqueeze(-1).type_as(tensor)
         return (tensor * mask).sum(1) / mask.sum(1).clamp_min(1e-6)
 
-    def forward(self, audio_input_values, text_input_ids, text_attention_mask):
+    def forward(self, audio_input_values, text_input_ids, text_attention_mask, augmented_audio_input_values=None):
         # 使用半精度计算
         with torch.amp.autocast('cuda'):
             # 音频分支 - 使用更小的序列长度
             audio_outputs = self.audio_encoder(input_values=audio_input_values)
             # 使用池化而不是平均，减少计算量
             acoustic_features = torch.mean(audio_outputs.last_hidden_state, dim=1)
+            # 投影和分类
+            acoustic_embedding = self.audio_projection_head(acoustic_features)
+            audio_logits = self.audio_classifier(acoustic_features)
 
+            # --- 增强音频分支 (新增逻辑) ---
+            augmented_acoustic_embedding = None
+            if augmented_audio_input_values is not None:
+                # 使用相同的编码器和投影头
+                aug_audio_outputs = self.audio_encoder(input_values=augmented_audio_input_values)
+                aug_acoustic_features = torch.mean(aug_audio_outputs.last_hidden_state, dim=1)
+                augmented_acoustic_embedding = self.audio_projection_head(aug_acoustic_features)
+                # 注意：这里没有分类头，因为增强音频主要用于对比学习
             # 文本分支
             text_embedding = None
             if text_input_ids is not None:
@@ -139,11 +150,8 @@ class MemoryOptimizedContrastiveModel(nn.Module):
                 # text_features = torch.mean(text_outputs.last_hidden_state, dim=1)
                 text_embedding = self.text_projection_head(text_features)
 
-            # 投影和分类
-            acoustic_embedding = self.audio_projection_head(acoustic_features)
-            audio_logits = self.audio_classifier(acoustic_features)
 
-        return acoustic_embedding, text_embedding, audio_logits
+        return acoustic_embedding, text_embedding, audio_logits, augmented_acoustic_embedding
 
 class ContrastiveModel(nn.Module):
     """
@@ -326,13 +334,16 @@ class AcousticSupConModel(nn.Module):
         outputs_1 = self.audio_encoder(input_values=audio_input_1)
         features_1 = torch.mean(outputs_1.last_hidden_state, dim=1)
         embedding_1 = self.audio_projection_head(features_1)
-
-        outputs_2 = self.audio_encoder(input_values=audio_input_2)
-        features_2 = torch.mean(outputs_2.last_hidden_state, dim=1)
-        embedding_2 = self.audio_projection_head(features_2)
-
         # --- 计算分类 Logits ---
         # 通常只使用一个视图（例如第一个）的特征来做分类，以保持稳定性
         logits = self.audio_classifier(features_1)
 
-        return embedding_1, embedding_2, logits
+        if audio_input_2 is not None: # 仅在训练时
+            outputs_2 = self.audio_encoder(input_values=audio_input_2)
+            features_2 = torch.mean(outputs_2.last_hidden_state, dim=1)
+            embedding_2 = self.audio_projection_head(features_2)
+            return embedding_1, embedding_2, logits
+        else:
+            # --- 评估模式 ---
+            # 只返回 logits，其他两个返回 None 以匹配训练时的输出元组结构
+            return None, None, logits
