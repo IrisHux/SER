@@ -1,5 +1,6 @@
 import os.path
 import logging
+import numpy as np
 from matplotlib import pyplot as plt
 from sklearn.metrics import ConfusionMatrixDisplay
 from typing import List, Dict
@@ -55,12 +56,16 @@ class PlotVisualizer:
 
     @classmethod
     def plot_confusion_matrix(
-        cls, confusion_matrix: List[List[int]], labels: List[str], filename: str = None
+        cls, confusion_matrix: List[List[int]], labels: List[str], filename: str = None, normalize: bool = True
     ):
+        # 对混淆矩阵进行归一化处理（如果需要）
+        if normalize:
+            confusion_matrix = confusion_matrix.astype('float') / confusion_matrix.sum(axis=1)[:, np.newaxis]*100
+            confusion_matrix = np.nan_to_num(confusion_matrix)  # 将NaN替换为0
+
         # 创建混淆矩阵显示对象并绘制
-        ConfusionMatrixDisplay(confusion_matrix, display_labels=labels).plot()
-        
-            
+        ConfusionMatrixDisplay(confusion_matrix, display_labels=labels).plot(cmap=plt.cm.Blues, values_format='.2f' if normalize else 'd')
+
         if filename is None:
             plt.show()
         else:
