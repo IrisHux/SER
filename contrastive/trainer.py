@@ -12,8 +12,7 @@ import itertools
 from core.trainer import AbstractTrainer
 from core.config import CONFIG, device
 from contrastive.model import ContrastiveModel, MemoryOptimizedContrastiveModel, AcousticSupConModel
-from contrastive.loss import SupConLoss
-from pytorch_metric_learning.losses import NTXentLoss 
+from contrastive.loss import SupConLoss, InfoNCELoss
 
 logger = logging.getLogger(__name__)
 
@@ -200,7 +199,6 @@ class ContrastiveTrainer(AbstractTrainer):
                             loss_intra_contrastive = self.sup_con_loss(acoustic_embedding, augmented_acoustic_embedding, labels)
 
                         total_loss = self.alpha * (loss_inter_contrastive + loss_intra_contrastive) + loss_ce # 根据 alpha 加权组合损失
-
                         scaled_loss = total_loss / self.gradient_accumulation_steps # 用于梯度累积的损失缩放
 
                     # --- 3. 反向传播与优化 ---
@@ -315,12 +313,9 @@ class AblationNoLabelTrainer(ContrastiveTrainer):
         super().__init__(model, num_epochs, learning_rate, alpha, optimizer_type, gradient_accumulation_steps)
 
         # 2. [修改] 将损失函数替换为无监督的 NTXentLoss
-        print("--- [损失函数修改] 使用无监督对比损失 NTXentLoss (InfoNCE) ---")
-        self.contrastive_loss = NTXentLoss(temperature=0.1)
+        print("--- [损失函数修改] 使用无监督对比损失 InfoNCELoss ---")
+        self.contrastive_loss = InfoNCELoss(temperature=0.1)
         # 交叉熵损失 self.cross_entropy_loss 保持不变，已在父类中创建
-
-        # 我们仍然需要交叉熵损失来训练分类头
-        self.cross_entropy_loss = nn.CrossEntropyLoss()
         
         # 3. [修改] 更新模型名称，用于保存和绘图
         self._name = "Ablation_LGCA_no_Label"
@@ -350,29 +345,26 @@ class AblationNoLabelTrainer(ContrastiveTrainer):
 
             for step, batch in enumerate(loader):
                 try:
-                    acoustic_embedding, text_embedding, audio_logits, labels = self._get_outputs_and_labels(batch)
+                    acoustic_embedding, text_embedding, audio_logits, augmented_acoustic_embedding, labels = self._get_outputs_and_labels(batch)
 
                     with torch.amp.autocast('cuda'):
-                        # 分类损失的计算方式保持不变
+                        # 1. 分类损失的计算方式保持不变
                         loss_ce = self.cross_entropy_loss(audio_logits, labels)
 
-                        # 对比损失的计算方式现在不同了
-                        # 我们将两种模态的嵌入向量合并成一个张量，以输入给损失函数
-                        # 前半部分 (声学) 将与后半部分 (文本) 配对
-                        embeddings_for_loss = torch.cat([acoustic_embedding, text_embedding], dim=0)
+                        # 3. [核心修正] 计算无监督对比损失
+                        #    我们的新 InfoNCELoss 期望 (view1, view2)
                         
-                        # 我们需要为 NTXentLoss 创建特殊的 "标签" 来指明正样本对
-                        # 这里的标签就是 [0, 1, ..., B-1, 0, 1, ..., B-1]，
-                        # 它告诉损失函数 acoustic_embedding[i] 和 text_embedding[i] 是一对正样本
-                        batch_size = acoustic_embedding.shape[0]
-                        ntxent_labels = torch.arange(batch_size, device=device)
-                        ntxent_labels = torch.cat([ntxent_labels, ntxent_labels], dim=0)
+                        # a. 跨模态损失 (Audio-Text)
+                        #    直接传入两个视图，不再需要手动创建标签
+                        loss_inter_contrastive = self.contrastive_loss(acoustic_embedding, text_embedding)
                         
-                        loss_contrastive = self.contrastive_loss(embeddings_for_loss, ntxent_labels)
-
-                        # 总损失仍然是加权和
-                        total_loss = self._alpha * loss_contrastive + loss_ce
-                        
+                        # b. 模态内损失 (Audio-Audio_Augmented)
+                        loss_intra_contrastive = 0
+                        if augmented_acoustic_embedding is not None:
+                            # 同样直接传入两个视图
+                            loss_intra_contrastive = self.contrastive_loss(acoustic_embedding, augmented_acoustic_embedding)                        
+                        # 3. 计算总损失，保持公平的结构
+                        total_loss = self.alpha * (loss_inter_contrastive + loss_intra_contrastive) + loss_ce
                         scaled_loss = total_loss / self.gradient_accumulation_steps
 
                     self.scaler.scale(scaled_loss).backward()
@@ -392,7 +384,12 @@ class AblationNoLabelTrainer(ContrastiveTrainer):
                         self._optimizer.zero_grad()
                         
                         # 更新进度条显示
-                        loader.set_postfix(loss=total_loss.item(), acc=accuracy.item(), contrast=loss_contrastive.item(), ce=loss_ce.item())
+                          # [核心修改] 更新进度条显示以反映新的损失分量
+                        loss_intra_val = loss_intra_contrastive.item() if torch.is_tensor(loss_intra_contrastive) else loss_intra_contrastive
+                        loader.set_postfix(
+                            loss=total_loss.item(), acc=accuracy.item(), ce=loss_ce.item(), 
+                            inter_con=loss_inter_contrastive.item(), intra_con=loss_intra_val
+                        )
 
                     if step % 20 == 0:
                         gc.collect()

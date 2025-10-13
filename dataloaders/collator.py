@@ -3,7 +3,7 @@
 import torch
 from transformers import Wav2Vec2Processor, Wav2Vec2FeatureExtractor
 from typing import List, Dict, Tuple
-SECONDES = 2
+SECONDES = 1
 
 class AudioDataCollator:
     """

@@ -3,7 +3,7 @@
 import torch
 from transformers import Wav2Vec2FeatureExtractor, AutoTokenizer
 from typing import List, Dict
-SECONDES = 2
+SECONDES = 1
 class ContrastiveDataCollator:
     """
     为双模态对比学习进行实时数据处理。
