@@ -89,6 +89,105 @@ class ContrastiveTrainer(AbstractTrainer):
         self.gradient_accumulation_steps = gradient_accumulation_steps
         self.scaler = torch.amp.GradScaler(enabled=True) # 用于混合精度训练
         print(f"[INFO] 使用梯度累积步数: {gradient_accumulation_steps}, 损失权重 alpha: {self.alpha}")
+    
+    # ===== 封装的通用方法 =====
+    
+    def _perform_optimization_step(self, step: int):
+        """
+        执行梯度裁剪、优化器步骤、学习率更新等通用优化操作。
+        
+        Args:
+            step (int): 当前训练步数
+        
+        Returns:
+            bool: 是否执行了优化步骤
+        """
+        if (step + 1) % self.gradient_accumulation_steps == 0:
+            # 1. 梯度裁剪
+            self.scaler.unscale_(self._optimizer)
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            # 2. 优化器更新权重
+            self.scaler.step(self._optimizer)
+            self.scaler.update()
+            # 3. 更新学习率
+            if hasattr(self, 'scheduler'):
+                self.scheduler.step()
+            # 4. 清空梯度
+            self._optimizer.zero_grad()
+            return True
+        return False
+    
+    def _cleanup_memory(self, step: int, interval: int = 20):
+        """
+        定期清理GPU和CPU内存。
+        
+        Args:
+            step (int): 当前步数
+            interval (int): 清理间隔
+        """
+        if step % interval == 0:
+            gc.collect()
+            torch.cuda.empty_cache()
+    
+    def _run_validation_epoch(self, val_dataloader, epoch: int) -> tuple:
+        """
+        运行一个完整的验证epoch，计算损失、准确率和UAR。
+        
+        Args:
+            val_dataloader: 验证数据加载器
+            epoch (int): 当前epoch数
+        
+        Returns:
+            tuple: (avg_val_loss, avg_val_acc, val_uar)
+        """
+        self.model.eval()
+        epoch_val_losses, epoch_val_accuracies = [], []
+        all_preds, all_labels = [], []
+        
+        val_loader = tqdm.tqdm(val_dataloader, desc=f"Epoch {epoch} [验证中]")
+        with torch.no_grad():
+            for batch in val_loader:
+                if not batch: 
+                    continue
+                
+                # 获取logits和真实标签
+                logits, labels = self._get_logits_and_real(batch)
+                
+                # 计算交叉熵损失
+                val_loss = self.cross_entropy_loss(logits, labels)
+                preds = torch.argmax(logits, dim=1)
+                val_accuracy = (preds == labels).float().mean()
+                
+                # 收集指标
+                epoch_val_losses.append(val_loss.item())
+                epoch_val_accuracies.append(val_accuracy.item())
+                all_preds.extend(preds.cpu().numpy())
+                all_labels.extend(labels.cpu().numpy())
+        
+        # 计算平均指标
+        avg_val_loss = np.mean(epoch_val_losses)
+        avg_val_acc = np.mean(epoch_val_accuracies)
+        
+        # 计算UAR
+        from sklearn.metrics import recall_score
+        val_uar = recall_score(all_labels, all_preds, average='macro', zero_division=0)
+        
+        return avg_val_loss, avg_val_acc, val_uar
+    
+    def _log_epoch_summary(self, epoch: int, train_loss: float, train_acc: float,
+                          val_loss: float = None, val_acc: float = None, val_uar: float = None):
+        """
+        打印epoch总结日志。
+
+        """
+        log_msg = f"Epoch {epoch} 总结: 训练损失: {train_loss:.4f}, 训练准确率: {train_acc:.4f}"
+        
+        if val_loss is not None and val_acc is not None and val_uar is not None:
+            log_msg += f", 验证损失: {val_loss:.4f}, 验证准确率: {val_acc:.4f}, 验证UAR: {val_uar:.4f}"
+        
+        logger.info(log_msg)
+    
+    # ===== 原有方法 =====
 
     def _get_outputs_and_labels(self, batch: dict):
         """
@@ -144,7 +243,6 @@ class ContrastiveTrainer(AbstractTrainer):
         Args:
             val_uar (float): 当前epoch的验证UAR
             epoch (int): 当前epoch数
-            min_epoch (int): 开始保存模型的最小epoch数，默认为12
         """
         if not hasattr(self, 'best_uar') or val_uar > self.best_uar:
             self.best_uar = val_uar
@@ -152,29 +250,36 @@ class ContrastiveTrainer(AbstractTrainer):
             torch.save(self.model.state_dict(), save_path)
             logger.info(f"新的最佳UAR模型已保存: {val_uar:.4f} (Epoch {epoch}) -> {save_path}")
     
+    def _initialize_training(self, train_dataloader) -> transformers.optimization.LambdaLR:
+        """
+        初始化训练所需的学习率调度器。
+        
+        Args:
+            train_dataloader: 训练数据加载器
+        
+        Returns:
+            学习率调度器
+        """
+        total_steps = len(train_dataloader) // self.gradient_accumulation_steps * self._num_epochs
+        total_steps = max(1, total_steps)
+        
+        scheduler = transformers.get_linear_schedule_with_warmup(
+            self._optimizer, num_warmup_steps=0, num_training_steps=total_steps
+        )
+        return scheduler
+    
     def train(self, train_dataloader, val_dataloader=None):
         """
         重写核心的训练方法。
         """
-        
-        total_steps = len(train_dataloader) // self.gradient_accumulation_steps * self._num_epochs
-        # 确保 total_steps 至少为1，避免学习率调度器出错
-        total_steps = max(1, total_steps)
-
-        scheduler = transformers.get_linear_schedule_with_warmup(
-            self._optimizer, num_warmup_steps=0, num_training_steps=total_steps
-        )
-
-        # history_loss = []
-        # history_acc = []
+        # 初始化学习率调度器
+        self.scheduler = self._initialize_training(train_dataloader)
 
         # 用于存储每个epoch的平均指标
         history_train_loss, history_train_acc = [], []
         history_val_loss, history_val_acc = [], []
 
-
         logger.info(f"开始训练 {self._name} 模型...")
-
 
         for epoch in range(1, self._num_epochs + 1):
     
@@ -182,8 +287,6 @@ class ContrastiveTrainer(AbstractTrainer):
             self.model.train()
             epoch_train_losses, epoch_train_accuracies = [], []
             loader = tqdm.tqdm(train_dataloader, desc=f"Epoch {epoch} [训练中]")
-            # 在epoch开始时，清零一次梯度,应该在更新后清零
-            # self._optimizer.zero_grad()
 
             for step, batch in enumerate(loader):
                 try:
@@ -201,7 +304,7 @@ class ContrastiveTrainer(AbstractTrainer):
                         total_loss = self.alpha * (loss_inter_contrastive + loss_intra_contrastive) + loss_ce # 根据 alpha 加权组合损失
                         scaled_loss = total_loss / self.gradient_accumulation_steps # 用于梯度累积的损失缩放
 
-                    # --- 3. 反向传播与优化 ---
+                    # --- 3. 反向传播 ---
                     self.scaler.scale(scaled_loss).backward()
 
                     # 计算准确率 (用于监控)
@@ -212,20 +315,9 @@ class ContrastiveTrainer(AbstractTrainer):
                     epoch_train_accuracies.append(accuracy.item())
 
                     # 梯度累积步骤
-                    if (step + 1) % self.gradient_accumulation_steps == 0:
-                        # 1. 梯度裁剪
-                        self.scaler.unscale_(self._optimizer)
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-                        # 2. 优化器更新权重
-                        self.scaler.step(self._optimizer)
-                        self.scaler.update() # 3. 更新 GradScaler
-                        scheduler.step() # 4. 更新学习率
-                        self._optimizer.zero_grad() # 5. 清空梯度，为下一个累积周期做准备
-
-                        # 为了让显示的数值更直观，我们只取损失张量的数值部分 (.item())
-                        # 注意 loss_intra_contrastive 可能是一个 float 0，所以不需要 .item()
+                    if self._perform_optimization_step(step):
+                        # 更新进度条显示
                         loss_intra_val = loss_intra_contrastive.item() if torch.is_tensor(loss_intra_contrastive) else loss_intra_contrastive
-
                         loader.set_postfix(
                             loss=total_loss.item(), 
                             acc=accuracy.item(), 
@@ -235,65 +327,33 @@ class ContrastiveTrainer(AbstractTrainer):
                         )
 
                     # 清理内存
-                    if step % 20 == 0:
-                        gc.collect()
-                        torch.cuda.empty_cache()
+                    self._cleanup_memory(step)
 
                 except Exception as e:
                     tqdm.tqdm.write(f"训练步骤 {step} 出错: {e}")
-                    gc.collect()
-                    torch.cuda.empty_cache()
+                    self._cleanup_memory(step, interval=1)
 
             # 计算并存储该epoch的平均训练指标
             history_train_loss.append(np.mean(epoch_train_losses))
             history_train_acc.append(np.mean(epoch_train_accuracies))
 
-
-            # --- 验证循环 (一个 Epoch，采用单模态评估) ---
+            # --- 验证循环 (使用封装的方法) ---
             if val_dataloader:
-                self.model.eval()
-                epoch_val_losses, epoch_val_accuracies = [], []
-                all_preds, all_labels = [], []  # 收集所有预测和标签用于计算UAR
-                val_loader = tqdm.tqdm(val_dataloader, desc=f"Epoch {epoch} [验证中]")
-                with torch.no_grad():
-                    for batch in val_loader:
-                        if not batch: continue
-                        
-                        # acoustic_embedding, text_embedding, audio_logits, labels = self._get_outputs_and_labels(batch) #这是双模态前向传播
-
-                        # **使用单模态方法，只获取logits和真实标签**
-                        logits, labels = self._get_logits_and_real(batch)
-
-                        # **只计算交叉熵损失，因为它直接反映分类性能**
-                        val_loss = self.cross_entropy_loss(logits, labels)
-                        preds = torch.argmax(logits, dim=1)
-                        val_accuracy = (preds == labels).float().mean()
-                        
-                        epoch_val_losses.append(val_loss.item())
-                        epoch_val_accuracies.append(val_accuracy.item())
-
-                        # 收集预测和标签
-                        all_preds.extend(preds.cpu().numpy())
-                        all_labels.extend(labels.cpu().numpy())
-
-                # 计算并存储该epoch的平均验证指标
-                history_val_loss.append(np.mean(epoch_val_losses))
-                history_val_acc.append(np.mean(epoch_val_accuracies))
+                avg_val_loss, avg_val_acc, val_uar = self._run_validation_epoch(val_dataloader, epoch)
                 
-                # 计算UAR (非加权平均召回率)
-                from sklearn.metrics import recall_score
-                val_uar = recall_score(all_labels, all_preds, average='macro')
+                history_val_loss.append(avg_val_loss)
+                history_val_acc.append(avg_val_acc)
                 
-                logger.info(f"Epoch {epoch} 总结: 训练损失: {history_train_loss[-1]:.4f}, 训练准确率: {history_train_acc[-1]:.4f}, "
-                            f"验证损失: {np.mean(epoch_val_losses):.4f}, 验证准确率: {np.mean(epoch_val_accuracies):.4f}, "
-                            f"验证UAR: {val_uar:.4f}")
+                # 打印epoch总结
+                self._log_epoch_summary(epoch, history_train_loss[-1], history_train_acc[-1],
+                                       avg_val_loss, avg_val_acc, val_uar)
                 
                 # 保存最佳UAR模型
-                # if epoch >= 12:
                 self._save_best_model_if_improved(val_uar, epoch)
 
         # 所有epoch结束后，绘制训练曲线
         self.plot_histories(history_train_loss, history_train_acc, history_val_loss, history_val_acc)
+
 
 
 
@@ -326,12 +386,8 @@ class AblationNoLabelTrainer(ContrastiveTrainer):
         重写核心的训练方法以适应无监督对比损失。
         大部分逻辑与父类相同，仅修改损失计算部分。
         """
-        total_steps = len(train_dataloader) // self.gradient_accumulation_steps * self._num_epochs
-        total_steps = max(1, total_steps)
-
-        scheduler = transformers.get_linear_schedule_with_warmup(
-            self._optimizer, num_warmup_steps=0, num_training_steps=total_steps
-        )
+        # 初始化学习率调度器
+        self.scheduler = self._initialize_training(train_dataloader)
 
         history_train_loss, history_train_acc = [], []
         history_val_loss, history_val_acc = [], []
@@ -375,68 +431,39 @@ class AblationNoLabelTrainer(ContrastiveTrainer):
                     epoch_train_losses.append(total_loss.item())
                     epoch_train_accuracies.append(accuracy.item())
 
-                    if (step + 1) % self.gradient_accumulation_steps == 0:
-                        self.scaler.unscale_(self._optimizer)
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-                        self.scaler.step(self._optimizer)
-                        self.scaler.update()
-                        scheduler.step()
-                        self._optimizer.zero_grad()
-                        
+                    if self._perform_optimization_step(step):
                         # 更新进度条显示
-                          # [核心修改] 更新进度条显示以反映新的损失分量
                         loss_intra_val = loss_intra_contrastive.item() if torch.is_tensor(loss_intra_contrastive) else loss_intra_contrastive
                         loader.set_postfix(
                             loss=total_loss.item(), acc=accuracy.item(), ce=loss_ce.item(), 
                             inter_con=loss_inter_contrastive.item(), intra_con=loss_intra_val
                         )
 
-                    if step % 20 == 0:
-                        gc.collect()
-                        torch.cuda.empty_cache()
+                    self._cleanup_memory(step)
 
                 except Exception as e:
                     tqdm.tqdm.write(f"训练步骤 {step} 出错: {e}")
-                    gc.collect()
-                    torch.cuda.empty_cache()
+                    self._cleanup_memory(step, interval=1)
 
             history_train_loss.append(np.mean(epoch_train_losses))
             history_train_acc.append(np.mean(epoch_train_accuracies))
 
-            # 验证循环与父类完全相同，所以我们直接调用父类的逻辑
-            # 这里我们手动实现，因为我们重写了整个 train 方法
+            # 验证循环 (使用封装的方法)
             if val_dataloader:
-                self.model.eval()
-                epoch_val_losses, epoch_val_accuracies = [], []
-                all_preds, all_labels = [], []
-                val_loader = tqdm.tqdm(val_dataloader, desc=f"Epoch {epoch} [验证中]")
-                with torch.no_grad():
-                    for batch in val_loader:
-                        if not batch: continue
-                        logits, labels = self._get_logits_and_real(batch)
-                        val_loss = self.cross_entropy_loss(logits, labels)
-                        preds = torch.argmax(logits, dim=1)
-                        val_accuracy = (preds == labels).float().mean()
-                        
-                        epoch_val_losses.append(val_loss.item())
-                        epoch_val_accuracies.append(val_accuracy.item())
-                        all_preds.extend(preds.cpu().numpy())
-                        all_labels.extend(labels.cpu().numpy())
-
-                history_val_loss.append(np.mean(epoch_val_losses))
-                history_val_acc.append(np.mean(epoch_val_accuracies))
+                avg_val_loss, avg_val_acc, val_uar = self._run_validation_epoch(val_dataloader, epoch)
                 
-                from sklearn.metrics import recall_score
-                val_uar = recall_score(all_labels, all_preds, average='macro')
+                history_val_loss.append(avg_val_loss)
+                history_val_acc.append(avg_val_acc)
                 
-                logger.info(f"Epoch {epoch} 总结: 训练损失: {history_train_loss[-1]:.4f}, 训练准确率: {history_train_acc[-1]:.4f}, "
-                            f"验证损失: {np.mean(epoch_val_losses):.4f}, 验证准确率: {np.mean(epoch_val_accuracies):.4f}, "
-                            f"验证UAR: {val_uar:.4f}")
+                # 打印epoch总结
+                self._log_epoch_summary(epoch, history_train_loss[-1], history_train_acc[-1],
+                                       avg_val_loss, avg_val_acc, val_uar)
                 
                 self._save_best_model_if_improved(val_uar, epoch)
 
         # 调用父类的绘图方法
         self.plot_histories(history_train_loss, history_train_acc, history_val_loss, history_val_acc)
+
 
 
 
@@ -551,12 +578,9 @@ class AblationNoTextTrainer(ContrastiveTrainer):
         [核心修改] 重写核心训练方法，以适配新的损失计算逻辑。
         大部分代码结构与父类 `ContrastiveTrainer.train` 相同。
         """
-        # --- 初始化 (完全复用父类逻辑) ---
-        total_steps = len(train_dataloader) // self.gradient_accumulation_steps * self._num_epochs
-        total_steps = max(1, total_steps)
-        scheduler = transformers.get_linear_schedule_with_warmup(
-            self._optimizer, num_warmup_steps=0, num_training_steps=total_steps
-        )
+        # 初始化学习率调度器
+        self.scheduler = self._initialize_training(train_dataloader)
+        
         history_train_loss, history_train_acc = [], []
         history_val_loss, history_val_acc = [], []
         logger.info(f"开始训练 {self._name} (Ablation w/o Text) 模型...")
@@ -585,7 +609,7 @@ class AblationNoTextTrainer(ContrastiveTrainer):
 
                         scaled_loss = total_loss / self.gradient_accumulation_steps
 
-                    # 3. 反向传播与优化 (完全复用父类逻辑)
+                    # 3. 反向传播
                     self.scaler.scale(scaled_loss).backward()
 
                     with torch.no_grad():
@@ -594,75 +618,32 @@ class AblationNoTextTrainer(ContrastiveTrainer):
                     epoch_train_losses.append(total_loss.item())
                     epoch_train_accuracies.append(accuracy.item())
 
-                    if (step + 1) % self.gradient_accumulation_steps == 0:
-                        self.scaler.unscale_(self._optimizer)
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-                        self.scaler.step(self._optimizer)
-                        self.scaler.update()
-                        scheduler.step()
-                        self._optimizer.zero_grad()
+                    if self._perform_optimization_step(step):
                         loader.set_postfix(loss=total_loss.item(), acc=accuracy.item(),
                                            sup_con=loss_sup_con.item(), ce=loss_ce.item())
 
-                    if step % 20 == 0:
-                        gc.collect()
-                        torch.cuda.empty_cache()
+                    self._cleanup_memory(step)
 
                 except Exception as e:
                     tqdm.tqdm.write(f"训练步骤 {step} 出错: {e}")
-                    gc.collect()
-                    torch.cuda.empty_cache()
+                    self._cleanup_memory(step, interval=1)
 
-            # --- 记录训练历史 (完全复用父类逻辑) ---
+            # 记录训练历史
             history_train_loss.append(np.mean(epoch_train_losses))
             history_train_acc.append(np.mean(epoch_train_accuracies))
 
-            # --- 验证循环 (完全复用父类逻辑) ---
+            # 验证循环 (使用封装的方法)
             if val_dataloader:
-                self.model.eval() # 1. 设置为评估模式
-                epoch_val_losses, epoch_val_accuracies = [], []
-                all_preds, all_labels = [], [] # 用于计算UAR
-
-                # 2. 在 no_grad 上下文中进行
-                with torch.no_grad():
-                    val_loader = tqdm.tqdm(val_dataloader, desc=f"Epoch {epoch} [验证中]")
-                    for batch in val_loader:
-                        if not batch: continue
-
-                        # 3. 获取模型输出
-                        #    注意：这里我们只关心分类性能，所以使用 _get_logits_and_real
-                        logits, labels = self._get_logits_and_real(batch)
-
-                        # 4. 计算验证损失
-                        #    在验证时，只关心分类损失 (CrossEntropy)
-                        val_loss = self.cross_entropy_loss(logits, labels)
-
-                        # 5. 计算预测和准确率
-                        preds = torch.argmax(logits, dim=1)
-                        val_accuracy = (preds == labels).float().mean()
-
-                        # 6. 收集数据用于后续指标计算
-                        epoch_val_losses.append(val_loss.item())
-                        epoch_val_accuracies.append(val_accuracy.item())
-                        all_preds.extend(preds.cpu().numpy())
-                        all_labels.extend(labels.cpu().numpy())
-
-                # 7. 计算并记录整个 epoch 的平均指标
-                avg_val_loss = np.mean(epoch_val_losses)
-                avg_val_acc = np.mean(epoch_val_accuracies)
-                # UAR 是基于整个验证集的所有预测来计算的
-                from sklearn.metrics import recall_score
-                val_uar = recall_score(all_labels, all_preds, average='macro', zero_division=0)
-
+                avg_val_loss, avg_val_acc, val_uar = self._run_validation_epoch(val_dataloader, epoch)
+                
                 history_val_loss.append(avg_val_loss)
                 history_val_acc.append(avg_val_acc)
-
-                logger.info(f"Epoch {epoch} 总结: Train Loss: {history_train_loss[-1]:.4f}, Train Acc: {history_train_acc[-1]:.4f}, "
-                            f"Val Loss: {avg_val_loss:.4f}, Val Acc: {avg_val_acc:.4f}, Val UAR: {val_uar:.4f}")
-
-                # 保存最佳模型
-                # if epoch >= 12:
+                
+                # 打印epoch总结
+                self._log_epoch_summary(epoch, history_train_loss[-1], history_train_acc[-1],
+                                       avg_val_loss, avg_val_acc, val_uar)
+                
                 self._save_best_model_if_improved(val_uar, epoch)
 
-        # --- 绘图 (完全复用父类逻辑) ---
+        # 绘图
         self.plot_histories(history_train_loss, history_train_acc, history_val_loss, history_val_acc)
