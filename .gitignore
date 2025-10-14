@@ -1,5 +1,7 @@
 __pycache__/
 *.pyc
+*.pkl
+*.pt
 saved_models/
 dataset/
 pictures/
