@@ -8,4 +8,7 @@ pictures/
 tables/
 exp/
 .venv/
+.github/
+.specify/
+.vscode/
 checkpoints/
