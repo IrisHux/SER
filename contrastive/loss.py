@@ -15,6 +15,7 @@ class SupConLoss(nn.Module):
     def forward(self, acoustic_embeddings, text_embeddings, labels):
         """
         计算双模态输入的监督对比损失。
+        此版本旨在拉近具有相同情感标签的音频和文本嵌入。
 
         Args:
             acoustic_embeddings (torch.Tensor): 声学模态的嵌入向量。形状: (B, D)
@@ -32,45 +33,37 @@ class SupConLoss(nn.Module):
         acoustic_embeddings = nn.functional.normalize(acoustic_embeddings, p=2, dim=1)
         text_embeddings = nn.functional.normalize(text_embeddings, p=2, dim=1)
 
-        # --- 2. 修正：将特征和标签沿批次维度拼接 ---
-        # 之前的方法是交错拼接，现在改为顺序拼接，逻辑更清晰
-        # 形成一个 (2*B, D) 的大批次特征矩阵
-        features = torch.cat([acoustic_embeddings, text_embeddings], dim=0)
+        # --- 2. 计算跨模态相似度矩阵 ---
+        # 形状: (B, B)， sim[i, j] 表示 audio_i 和 text_j 的相似度
+        similarity_matrix = torch.matmul(acoustic_embeddings, text_embeddings.T) / self.temperature
 
-        # 对应地，标签也需要复制和拼接，以匹配新的特征矩阵
-        # [label_1, label_2] -> [label_1, label_2, label_1, label_2]
-        labels = labels.repeat(2)
+        # --- 3. 构造正样本对的掩码 (Mask) ---
+        # 如果 audio_i 和 text_j 的情感标签相同，则它们是正样本对
+        labels_row = labels.unsqueeze(1) # 形状: (B, 1)
+        labels_col = labels.unsqueeze(0) # 形状: (1, B)
+        positive_mask = torch.eq(labels_row, labels_col).float().to(device)
 
-        # --- 3. 构造正样本对的“标签掩码” (Mask) ---
-        # 现在 mask 的形状是 (2*B, 2*B)，能正确反映所有样本间的关系
-        mask = torch.eq(labels.unsqueeze(0), labels.unsqueeze(1)).float().to(device)
+        # --- 4. 计算损失 ---
+        # 我们希望对于每个 audio anchor，其对应的 text positive samples 的概率之和最大化。
+        # positive_mask 已经定义了哪些是正样本。
+        # CrossEntropyLoss 的标签可以是软标签（概率分布）。
+        # 我们将 positive_mask 归一化，使其每一行的和为1，作为目标概率分布。
+        target_labels = positive_mask / (positive_mask.sum(dim=1, keepdim=True) + 1e-8)
 
-        # --- 4. 计算相似度矩阵 ---
-        # 这部分逻辑不变
-        similarity_matrix = torch.matmul(features, features.T) / self.temperature
+        # 计算从音频到文本的损失
+        # 使用 log_softmax 手动计算交叉熵，以支持软标签
+        log_softmax_sim_a2t = F.log_softmax(similarity_matrix, dim=1)
+        loss_a2t = -torch.sum(target_labels * log_softmax_sim_a2t, dim=1).mean()
 
-        # --- 5. 构造用于计算损失的掩码 ---
-        # 排除对角线（样本与自身的比较）
-        logits_mask = torch.scatter(
-            torch.ones_like(mask),
-            1,
-            torch.arange(batch_size * 2).view(-1, 1).to(device),
-            0
-        )
-        mask = mask * logits_mask
+        # 计算从文本到音频的损失 (对称)
+        log_softmax_sim_t2a = F.log_softmax(similarity_matrix.T, dim=1)
+        loss_t2a = -torch.sum(target_labels.T * log_softmax_sim_t2a, dim=1).mean()
 
-        # --- 6. 计算最终损失 ---
-        # 这部分逻辑不变
-        exp_logits = torch.exp(similarity_matrix) * logits_mask
-        log_prob = similarity_matrix - torch.log(exp_logits.sum(1, keepdim=True))
-
-        # (mask.sum(1)) 可能为0（如果没有其他正样本），为避免除以0，加上一个极小值
-        mean_log_prob_pos = (mask * log_prob).sum(1) / (mask.sum(1) + 1e-8)
-
-        # 对整个批次的损失求平均
-        loss = - mean_log_prob_pos.mean()
+        # 最终损失是两个方向损失的平均值
+        loss = (loss_a2t + loss_t2a) / 2
 
         return loss
+    
     
 class InfoNCELoss(nn.Module):
     """
