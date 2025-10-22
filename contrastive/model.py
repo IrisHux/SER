@@ -3,7 +3,7 @@ import os
 import safetensors
 import torch
 import torch.nn as nn
-
+import torch.nn.functional as F
 
 from core.config import CONFIG, device
 from torch.optim.lr_scheduler import CosineAnnealingLR
@@ -33,7 +33,33 @@ def setup_memory_optimization():
     print(f"GPU总内存: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
     print("内存优化设置完成")
 
+# 步骤 1: 定义一个可复用的交叉注意力模块
+class CrossAttentionLayer(nn.Module):
+    def __init__(self, d_model, n_heads, dropout=0.1):
+        super().__init__()
+        self.attention = nn.MultiheadAttention(embed_dim=d_model, num_heads=n_heads, dropout=dropout, batch_first=True)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, d_model * 4),
+            nn.GELU(),
+            nn.Linear(d_model * 4, d_model)
+        )
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
 
+    def forward(self, query, key_value):
+        # query: [Batch, SeqLen_Q, Dim] - 发出查询的模态
+        # key_value: [Batch, SeqLen_KV, Dim] - 被查询的模态
+
+        # 交叉注意力 + Add & Norm
+        attn_output, _ = self.attention(query, key_value, key_value)
+        x = self.norm1(query + self.dropout(attn_output))
+
+        # FFN + Add & Norm
+        ffn_output = self.ffn(x)
+        x = self.norm2(x + self.dropout(ffn_output))
+        
+        return x
 # ===============================
 # 2. 内存优化的模型配置
 # ===============================
@@ -83,7 +109,25 @@ class MemoryOptimizedContrastiveModel(nn.Module):
             nn.Linear(projection_dims[0], projection_dims[1])
         )
 
-        self.audio_classifier = nn.Linear(audio_hidden_size, num_labels)
+        # self.audio_classifier = nn.Linear(audio_hidden_size, num_labels)
+        # --- 3. [新] 门控交叉注意力融合分支 (用于 Loss_CE) ---
+        acoustic_dim = self.audio_encoder.config.hidden_size # 768
+        text_dim = self.text_encoder.config.hidden_size       # 768
+        self.d_model = CONFIG.fusion_dim()                # 768
+        self.num_heads = CONFIG.fusion_heads()            # 8
+        
+        # 维度对齐层 (保持不变)
+        self.acoustic_projector = nn.Linear(acoustic_dim, self.d_model) if acoustic_dim != self.d_model else nn.Identity()
+        self.text_projector = nn.Linear(text_dim, self.d_model) if text_dim != self.d_model else nn.Identity()
+
+        # [新] 定义声学 "查询" 文本的交叉注意力层
+        # 我们只需要一个方向：声学(Ha) "查询" 文本(Hb)
+        self.audio_queries_text_attention = CrossAttentionLayer(self.d_model, self.num_heads)
+
+        # [新] 最终的分类器
+        # 注意：输入维度现在只是 d_model (768)，而不是 d_model * 2
+        # 因为我们是 H_a + Fused_T，而不是 Concat(H_a, Fused_T)
+        self.final_classifier = nn.Linear(self.d_model, num_labels)
 
     def _freeze_model_parts(self, num_text_layers_to_freeze: int):
         """
@@ -120,16 +164,22 @@ class MemoryOptimizedContrastiveModel(nn.Module):
         mask = mask.unsqueeze(-1).type_as(tensor)
         return (tensor * mask).sum(1) / mask.sum(1).clamp_min(1e-6)
 
-    def forward(self, audio_input_values, text_input_ids, text_attention_mask, augmented_audio_input_values=None):
+    def forward(self, audio_input_values, text_input_ids, text_attention_mask, augmented_audio_input_values=None, use_text_modality=True):
         # 使用半精度计算
         with torch.amp.autocast('cuda'):
+            # ==========================================================
+            # 阶段 1: 独立编码
+            # ==========================================================
+            # Ha_sequence: [Batch, SeqLen_A, 768]
+            Ha_sequence = self.audio_encoder(input_values=audio_input_values).last_hidden_state
+
             # 音频分支 - 使用更小的序列长度
-            audio_outputs = self.audio_encoder(input_values=audio_input_values)
+            # audio_outputs = self.audio_encoder(input_values=audio_input_values)
             # 使用池化而不是平均，减少计算量
-            acoustic_features = torch.mean(audio_outputs.last_hidden_state, dim=1)
+            pooled_Ha = torch.mean(Ha_sequence, dim=1)
             # 投影和分类
-            acoustic_embedding = self.audio_projection_head(acoustic_features)
-            audio_logits = self.audio_classifier(acoustic_features)
+            acoustic_embedding = self.audio_projection_head(pooled_Ha)
+            # final_logits = self.audio_classifier(pooled_Ha)
 
             # --- 增强音频分支 (新增逻辑) ---
             augmented_acoustic_embedding = None
@@ -141,155 +191,48 @@ class MemoryOptimizedContrastiveModel(nn.Module):
                 # 注意：这里没有分类头，因为增强音频主要用于对比学习
             # 文本分支
             text_embedding = None
+            Hb_sequence = None
             if text_input_ids is not None:
-                text_outputs = self.text_encoder(
+                Hb_sequence = self.text_encoder(
                     input_ids=text_input_ids,
                     attention_mask=text_attention_mask
-                )
-                text_features = self.masked_mean(text_outputs.last_hidden_state, text_attention_mask)
+                ).last_hidden_state
+                pooled_Hb = self.masked_mean(Hb_sequence, text_attention_mask)
                 # text_features = torch.mean(text_outputs.last_hidden_state, dim=1)
-                text_embedding = self.text_projection_head(text_features)
+                text_embedding = self.text_projection_head(pooled_Hb)
 
-
-        return acoustic_embedding, text_embedding, audio_logits, augmented_acoustic_embedding
-
-class ContrastiveModel(nn.Module):
-    """
-    双模态对比学习模型 (LGCA框架的核心)。
-    该模型包含一个声学编码器 (WavLM) 和一个文本编码器 (DeBERTa)，
-    并为两者分别附加了投影头，用于生成对比学习所需的嵌入向量。
-    """
-    def __init__(self, num_labels: int):
-        super().__init__()
-
-        # --- 1. 实例化声学和文本编码器的基础模型 (Backbone) ---
-        # 我们从Hugging Face加载预训练的WavLM和DeBERTa模型。
-        # 注意：这里使用的是 WavLMModel 和 AutoModel，而不是 WavLMForSequenceClassification。
-        # 这是因为我们需要的是模型输出的特征表示 (hidden states)，而不是最终的分类结果。
-        self.audio_encoder = WavLMModel.from_pretrained(CONFIG.audio_encoder_name(), use_safetensors = True)
-        self.text_encoder = AutoModel.from_pretrained(CONFIG.text_encoder_name(), use_safetensors = True)
-
-        # 冻结部分编码器层以减少训练时的计算量和内存占用
-        # 这里我们冻结 WavLM 的 CNN 特征提取器和 DeBERTa 的前6层 Transformer 层
-        self._freeze_model_parts(num_text_layers_to_freeze=6)
-
-        # 获取编码器的输出维度，通常对于 "base" 模型是 768
-        audio_hidden_size = self.audio_encoder.config.hidden_size
-        text_hidden_size = self.text_encoder.config.hidden_size
-
-        # --- 2. 为每个模态定义投影头 (Projection Head) ---
-        # 投影头是一个简单的多层感知机 (MLP)，它将编码器输出的高维特征，
-        # 映射到一个统一的、较低维度的嵌入空间，用于计算对比损失。
-        # 投影头的维度配置从 config.yaml 文件中读取。
-        proj_config = CONFIG.projection_bridge_config()
-        projection_dims = proj_config['hidden_dims'] # 例如：[512, 256]
-
-        self.audio_projection_head = nn.Sequential(
-            nn.Linear(audio_hidden_size, projection_dims[0]),
-            nn.ReLU(),
-            nn.Linear(projection_dims[0], projection_dims[1])
-        )
-
-        self.text_projection_head = nn.Sequential(
-            nn.Linear(text_hidden_size, projection_dims[0]),
-            nn.ReLU(),
-            nn.Linear(projection_dims[0], projection_dims[1])
-        )
-
-        # --- 3. (为后续步骤准备) 为声学模型添加一个线性分类头 ---
-        # 这个分类头将在对比学习训练后，用于进行单模态的语音情感识别评估。
-        # 它的输入是声学编码器的原始特征 (投影之前)。
-        self.audio_classifier = nn.Linear(audio_hidden_size, num_labels)
-
-    def _freeze_model_parts(self, num_text_layers_to_freeze: int):
-        """
-        [内部方法] 冻结编码器的特定部分。
-        这个方法会直接修改 self.audio_encoder 和 self.text_encoder。
-        (此逻辑基于你原始的 __init__ 方法)
-        """
-        
-        # --- 1. 冻结 WavLM 的 CNN 特征提取器 ---
-        print("--- [修改] 正在冻结 WavLM 的 CNN Feature Extractor ---")
-        if hasattr(self.audio_encoder, 'feature_extractor'):
-            for param in self.audio_encoder.feature_extractor.parameters():
-                param.requires_grad = False
-        else:
-            print("[警告] audio_encoder 没有 'feature_extractor' 属性，跳过冻结。")
-
-        # --- 2. 冻结 DeBERTa 的 Embedding 层 ---
-        print("--- [修改] 正在冻结 DeBERTa 的 Embeddings ---")
-        if hasattr(self.text_encoder, 'embeddings'):
-            for param in self.text_encoder.embeddings.parameters():
-                param.requires_grad = False
-        else:
-            print("[警告] text_encoder 没有 'embeddings' 属性，跳过冻结。")
-
-        # --- 3. 冻结 DeBERTa 的底层 Transformer ---
-        print(f"--- [修改] 正在冻结 DeBERTa 的 Encoder 前 {num_text_layers_to_freeze} 层 ---")
-        if (hasattr(self.text_encoder, 'encoder') and 
-            hasattr(self.text_encoder.encoder, 'layer') and 
-            len(self.text_encoder.encoder.layer) > 0):
+            # ==========================================================
+            # [并行分支 B] 门控交叉注意力分类
+            # ==========================================================
             
-            total_layers = len(self.text_encoder.encoder.layer)
-            layers_to_freeze = min(num_text_layers_to_freeze, total_layers)
+            # 1. 维度对齐 (只对 Ha)
+            Ha_proj_sequence = self.acoustic_projector(Ha_sequence) # -> [B, SeqLen_A, 768]
 
-            if layers_to_freeze < num_text_layers_to_freeze:
-                 print(f"[警告] 想要冻结 {num_text_layers_to_freeze} 层, "
-                       f"但模型只有 {total_layers} 层。将只冻结 {layers_to_freeze} 层。")
+            # 2. 计算融合特征 H
+            if use_text_modality and Hb_sequence is not None:
+                # 训练阶段 (λ=1)
+                Hb_proj_sequence = self.text_projector(Hb_sequence) # -> [B, SeqLen_T, 768]
+                
+                # 计算“修正”信息
+                # Ha 作为 Query，去 Hb 中提取信息
+                correction_features = self.audio_queries_text_attention(
+                    query=Ha_proj_sequence, 
+                    key_value=Hb_proj_sequence
+                )
+                
+                # H = Ha + λ * CrossAttn(...)
+                fused_sequence = Ha_proj_sequence + correction_features
+            else:
+                # 推理阶段 (λ=0)
+                fused_sequence = Ha_proj_sequence # H = Ha
+            
+            # 3. 池化
+            pooled_fused_features = torch.mean(fused_sequence, dim=1)
 
-            for i, layer in enumerate(self.text_encoder.encoder.layer):
-                if i < layers_to_freeze:
-                    for param in layer.parameters():
-                        param.requires_grad = False
-        else:
-            print("[警告] text_encoder 没有 'encoder.layer' 结构，跳过底层 Transformer 冻结。")
+            # 4. 分类
+            final_logits = self.final_classifier(pooled_fused_features)
+        return acoustic_embedding, text_embedding, final_logits, augmented_acoustic_embedding
 
-        print("--- 编码器冻结操作完成 ---")
-
-    def forward(self, audio_input_values, text_input_ids=None, text_attention_mask=None):
-        """
-        模型的前向传播逻辑。
-
-        Args:
-            audio_input_values (torch.Tensor): 从音频预处理得到的输入张量。
-            text_input_ids (torch.Tensor): 从文本tokenizer得到的输入ID。
-            text_attention_mask (torch.Tensor): 文本输入的注意力掩码。
-
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-                - acoustic_embedding: 声学模态经过投影头后的嵌入向量。
-                - text_embedding: 文本模态经过投影头后的嵌入向量。
-                - audio_logits: 声学模态经过分类头后的logits (用于交叉熵损失)。
-        """
-        # --- 声学分支 ---
-        # 1. 通过WavLM编码器获取音频特征
-        audio_outputs = self.audio_encoder(input_values=audio_input_values)
-        # 2. 从最后一层隐藏状态中提取特征。我们通过在时间维度上取平均值来获得一个固定长度的句子级表示。
-        #    audio_outputs.last_hidden_state 的形状是 (batch_size, sequence_length, hidden_size)
-        acoustic_features = torch.mean(audio_outputs.last_hidden_state, dim=1)
-
-        # # --- 文本分支 ---
-        # # 1. 通过DeBERTa编码器获取文本特征
-        # text_outputs = self.text_encoder(input_ids=text_input_ids, attention_mask=text_attention_mask)
-        # # 2. 同样，对最后一层隐藏状态在序列长度维度上取平均，获得句子级表示。
-        # text_features = torch.mean(text_outputs.last_hidden_state, dim=1)
-
-        # --- 文本分支 (增加判断) ---
-        text_embedding = None
-        if text_input_ids is not None:
-            text_outputs = self.text_encoder(input_ids=text_input_ids, attention_mask=text_attention_mask)
-            text_features = torch.mean(text_outputs.last_hidden_state, dim=1)
-            text_embedding = self.text_projection_head(text_features)
-        
-        # --- 投影和分类 ---
-        # 3. 将声学和文本特征分别送入各自的投影头，生成用于对比学习的嵌入向量
-        acoustic_embedding = self.audio_projection_head(acoustic_features)
-        # text_embedding = self.text_projection_head(text_features)
-
-        # 4. 将声学特征送入分类头，生成用于分类任务的logits
-        audio_logits = self.audio_classifier(acoustic_features)
-
-        return acoustic_embedding, text_embedding, audio_logits
     
 
 class AcousticSupConModel(nn.Module):

@@ -11,7 +11,7 @@ import itertools
 
 from core.trainer import AbstractTrainer
 from core.config import CONFIG, device
-from contrastive.model import ContrastiveModel, MemoryOptimizedContrastiveModel, AcousticSupConModel
+from contrastive.model import MemoryOptimizedContrastiveModel, AcousticSupConModel
 from contrastive.loss import SupConLoss, InfoNCELoss
 
 logger = logging.getLogger(__name__)
@@ -51,7 +51,7 @@ class ContrastiveTrainer(AbstractTrainer):
             head_params = itertools.chain(
                 model.audio_projection_head.parameters(),
                 model.text_projection_head.parameters(),
-                model.audio_classifier.parameters()
+                model.final_classifier.parameters()
             )
             
             # 3. 创建参数组列表
@@ -189,9 +189,13 @@ class ContrastiveTrainer(AbstractTrainer):
     
     # ===== 原有方法 =====
 
-    def _get_outputs_and_labels(self, batch: dict):
+    def _get_outputs_and_labels(self, batch: dict, use_text_modality: bool = True):
         """
         一个辅助方法，用于处理输入批次并从模型获取所有输出。
+        Args:
+        use_text_modality (bool): 是否使用文本模态进行门控融合
+                                 True=训练模式（双模态融合）
+                                 False=验证/推理模式（纯声学）
         """
         # 从批次数据中解包音频、文本和标签
         audio_inputs = batch['audio_input_values'].to(device, non_blocking=True)
@@ -209,27 +213,35 @@ class ContrastiveTrainer(AbstractTrainer):
                 audio_input_values=audio_inputs,
                 text_input_ids=text_input_ids,
                 text_attention_mask=text_attention_mask,
-                augmented_audio_input_values=augmented_audio_inputs
+                augmented_audio_input_values=augmented_audio_inputs,
+                use_text_modality=use_text_modality  # 控制是否使用文本模态
             )
 
         return acoustic_embedding, text_embedding, audio_logits, augmented_acoustic_embedding, labels
 
     # --- *** 新增这个用于评估的方法 *** ---
-    def _get_logits_and_real(self, batch: dict) -> (torch.Tensor, torch.Tensor):
+    def _get_logits_and_real(self, batch: dict) -> tuple[torch.Tensor, torch.Tensor]:
         """
         为评估阶段实现此方法，以适配 AbstractTrainer 中的 eval 循环。
         该方法遵循“测试时单模态”的原则，只使用声学分支。
+        [关键修改]:
+        - 设置 use_text_modality=False 来模拟纯声学推理
+        - 门控机制会自动将 λ 设为 0，只使用 Ha
         """
         # 1. 从批次中解包音频输入和真实标签
         audio_inputs = batch['audio_input_values'].to(device, non_blocking=True)
+        text_input_ids = batch['text_input_ids'].to(device, non_blocking=True)
+        text_attention_mask = batch['text_attention_mask'].to(device, non_blocking=True)
         labels = batch['labels'].to(device, non_blocking=True)
         
         # 2. 模型前向传播（只获取 audio_logits）
         # 我们调用模型，但只关心第三个返回值
         _, _, audio_logits, _ = self.model(
             audio_input_values=audio_inputs,
-            text_input_ids=None, # <-- 在评估时，文本输入为None
-            text_attention_mask=None
+            text_input_ids=text_input_ids,
+            text_attention_mask=text_attention_mask,
+            augmented_audio_input_values=None,
+            use_text_modality=False  # <-- 关键修改：不使用文本模态
         )
         
         # 3. 返回 eval 方法期望的两个值
@@ -271,6 +283,9 @@ class ContrastiveTrainer(AbstractTrainer):
     def train(self, train_dataloader, val_dataloader=None):
         """
         重写核心的训练方法。
+        [关键修改]:
+        - 训练时使用 use_text_modality=True（双模态门控融合）
+        - 验证时通过 _get_logits_and_real 自动使用 use_text_modality=False（纯声学）
         """
         # 初始化学习率调度器
         self.scheduler = self._initialize_training(train_dataloader)
@@ -291,7 +306,8 @@ class ContrastiveTrainer(AbstractTrainer):
             for step, batch in enumerate(loader):
                 try:
                     # --- 2. 前向传播与损失计算 ---
-                    acoustic_embedding, text_embedding, audio_logits, augmented_acoustic_embedding, labels = self._get_outputs_and_labels(batch)
+                    acoustic_embedding, text_embedding, audio_logits, augmented_acoustic_embedding, labels = self._get_outputs_and_labels(
+                        batch, use_text_modality=True)  # 训练时使用双模态融合
 
                     with torch.amp.autocast('cuda'):
                         loss_inter_contrastive = self.sup_con_loss(acoustic_embedding, text_embedding, labels) # 计算监督对比损失

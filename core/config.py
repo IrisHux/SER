@@ -111,6 +111,17 @@ class CONFIG:
         return cls._dict["models"]["text_encoder"]
 
     @classmethod
+    def fusion_dim(cls):
+        """获取交叉注意力模块的工作维度"""
+        # 从 models 配置中获取 fusion_dim，如果不存在则提供一个安全的默认值
+        return cls._dict.get("models", {}).get("fusion_dim", 768)
+
+    @classmethod
+    def fusion_heads(cls):
+        """获取交叉注意力模块的头数"""
+        return cls._dict.get("models", {}).get("fusion_heads", 8)
+    
+    @classmethod
     def projection_bridge_config(cls):
         return cls._dict["models"]["projection_bridge"]
 

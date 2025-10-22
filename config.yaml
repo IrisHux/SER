@@ -34,6 +34,8 @@ models:
   audio_encoder: "microsoft/wavlm-base"
   # 文本编码器模型名称 (DeBERTa-V3-Base)
   text_encoder: "microsoft/deberta-v3-base"
+  fusion_dim: 768  # 注意力模块的工作维度
+  fusion_heads: 8  # 多头注意力的头数
   # MLP投影桥配置
   projection_bridge:
     layers: 2 # 投影桥层数
@@ -46,7 +48,7 @@ training:
   weight_decay: 0.01
   optimizer: "AdamW"
   loss_weights:
-    alpha: 1.0 # 经过验证的最优值
+    alpha: 0.3 # 经过验证的最优值
     # LLGCA loss 的权重 (α)
 
 plots:
