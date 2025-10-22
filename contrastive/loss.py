@@ -62,6 +62,13 @@ class SupConLoss(nn.Module):
         # 最终损失是两个方向损失的平均值
         loss = (loss_a2t + loss_t2a) / 2
 
+        # [NaN 检查] 如果损失为 NaN 或 Inf，返回一个可训练的小值
+        if torch.isnan(loss) or torch.isinf(loss):
+            print(f"⚠️  警告：检测到 NaN/Inf 损失！")
+            print(f"   - similarity_matrix 范围: [{similarity_matrix.min():.4f}, {similarity_matrix.max():.4f}]")
+            print(f"   - positive_mask 求和: {positive_mask.sum().item()}")
+            loss = torch.tensor(0.0, device=loss.device, requires_grad=True)
+
         return loss
     
     

@@ -165,72 +165,71 @@ class MemoryOptimizedContrastiveModel(nn.Module):
         return (tensor * mask).sum(1) / mask.sum(1).clamp_min(1e-6)
 
     def forward(self, audio_input_values, text_input_ids, text_attention_mask, augmented_audio_input_values=None, use_text_modality=True):
-        # 使用半精度计算
-        with torch.amp.autocast('cuda'):
-            # ==========================================================
-            # 阶段 1: 独立编码
-            # ==========================================================
-            # Ha_sequence: [Batch, SeqLen_A, 768]
-            Ha_sequence = self.audio_encoder(input_values=audio_input_values).last_hidden_state
+        # [修复 NaN] 移除模型内部的 autocast，避免与训练器中的 autocast 嵌套
+        # ==========================================================
+        # 阶段 1: 独立编码
+        # ==========================================================
+        # Ha_sequence: [Batch, SeqLen_A, 768]
+        Ha_sequence = self.audio_encoder(input_values=audio_input_values).last_hidden_state
 
-            # 音频分支 - 使用更小的序列长度
-            # audio_outputs = self.audio_encoder(input_values=audio_input_values)
-            # 使用池化而不是平均，减少计算量
-            pooled_Ha = torch.mean(Ha_sequence, dim=1)
-            # 投影和分类
-            acoustic_embedding = self.audio_projection_head(pooled_Ha)
-            # final_logits = self.audio_classifier(pooled_Ha)
+        # 音频分支 - 使用更小的序列长度
+        # audio_outputs = self.audio_encoder(input_values=audio_input_values)
+        # 使用池化而不是平均，减少计算量
+        pooled_Ha = torch.mean(Ha_sequence, dim=1)
+        # 投影和分类
+        acoustic_embedding = self.audio_projection_head(pooled_Ha)
+        # final_logits = self.audio_classifier(pooled_Ha)
 
-            # --- 增强音频分支 (新增逻辑) ---
-            augmented_acoustic_embedding = None
-            if augmented_audio_input_values is not None:
-                # 使用相同的编码器和投影头
-                aug_audio_outputs = self.audio_encoder(input_values=augmented_audio_input_values)
-                aug_acoustic_features = torch.mean(aug_audio_outputs.last_hidden_state, dim=1)
-                augmented_acoustic_embedding = self.audio_projection_head(aug_acoustic_features)
-                # 注意：这里没有分类头，因为增强音频主要用于对比学习
-            # 文本分支
-            text_embedding = None
-            Hb_sequence = None
-            if text_input_ids is not None:
-                Hb_sequence = self.text_encoder(
-                    input_ids=text_input_ids,
-                    attention_mask=text_attention_mask
-                ).last_hidden_state
-                pooled_Hb = self.masked_mean(Hb_sequence, text_attention_mask)
-                # text_features = torch.mean(text_outputs.last_hidden_state, dim=1)
-                text_embedding = self.text_projection_head(pooled_Hb)
+        # --- 增强音频分支 (新增逻辑) ---
+        augmented_acoustic_embedding = None
+        if augmented_audio_input_values is not None:
+            # 使用相同的编码器和投影头
+            aug_audio_outputs = self.audio_encoder(input_values=augmented_audio_input_values)
+            aug_acoustic_features = torch.mean(aug_audio_outputs.last_hidden_state, dim=1)
+            augmented_acoustic_embedding = self.audio_projection_head(aug_acoustic_features)
+            # 注意：这里没有分类头，因为增强音频主要用于对比学习
+        # 文本分支
+        text_embedding = None
+        Hb_sequence = None
+        if text_input_ids is not None:
+            Hb_sequence = self.text_encoder(
+                input_ids=text_input_ids,
+                attention_mask=text_attention_mask
+            ).last_hidden_state
+            pooled_Hb = self.masked_mean(Hb_sequence, text_attention_mask)
+            # text_features = torch.mean(text_outputs.last_hidden_state, dim=1)
+            text_embedding = self.text_projection_head(pooled_Hb)
 
-            # ==========================================================
-            # [并行分支 B] 门控交叉注意力分类
-            # ==========================================================
+        # ==========================================================
+        # [并行分支 B] 门控交叉注意力分类
+        # ==========================================================
+        
+        # 1. 维度对齐 (只对 Ha)
+        Ha_proj_sequence = self.acoustic_projector(Ha_sequence) # -> [B, SeqLen_A, 768]
+
+        # 2. 计算融合特征 H
+        if use_text_modality and Hb_sequence is not None:
+            # 训练阶段 (λ=1)
+            Hb_proj_sequence = self.text_projector(Hb_sequence) # -> [B, SeqLen_T, 768]
             
-            # 1. 维度对齐 (只对 Ha)
-            Ha_proj_sequence = self.acoustic_projector(Ha_sequence) # -> [B, SeqLen_A, 768]
-
-            # 2. 计算融合特征 H
-            if use_text_modality and Hb_sequence is not None:
-                # 训练阶段 (λ=1)
-                Hb_proj_sequence = self.text_projector(Hb_sequence) # -> [B, SeqLen_T, 768]
-                
-                # 计算“修正”信息
-                # Ha 作为 Query，去 Hb 中提取信息
-                correction_features = self.audio_queries_text_attention(
-                    query=Ha_proj_sequence, 
-                    key_value=Hb_proj_sequence
-                )
-                
-                # H = Ha + λ * CrossAttn(...)
-                fused_sequence = Ha_proj_sequence + correction_features
-            else:
-                # 推理阶段 (λ=0)
-                fused_sequence = Ha_proj_sequence # H = Ha
+            # 计算“修正”信息
+            # Ha 作为 Query，去 Hb 中提取信息
+            correction_features = self.audio_queries_text_attention(
+                query=Ha_proj_sequence, 
+                key_value=Hb_proj_sequence
+            )
             
-            # 3. 池化
-            pooled_fused_features = torch.mean(fused_sequence, dim=1)
+            # H = Ha + λ * CrossAttn(...)
+            fused_sequence = Ha_proj_sequence + correction_features
+        else:
+            # 推理阶段 (λ=0)
+            fused_sequence = Ha_proj_sequence # H = Ha
+        
+        # 3. 池化
+        pooled_fused_features = torch.mean(fused_sequence, dim=1)
 
-            # 4. 分类
-            final_logits = self.final_classifier(pooled_fused_features)
+        # 4. 分类
+        final_logits = self.final_classifier(pooled_fused_features)
         return acoustic_embedding, text_embedding, final_logits, augmented_acoustic_embedding
 
     
