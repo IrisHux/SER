@@ -186,6 +186,25 @@ class ContrastiveTrainer(AbstractTrainer):
             log_msg += f", 验证损失: {val_loss:.4f}, 验证准确率: {val_acc:.4f}, 验证UAR: {val_uar:.4f}"
         
         logger.info(log_msg)
+
+    def _cleanup_old_checkpoints(self):
+        """在训练开始前，清理与当前训练器名称匹配的旧检查点。"""
+        save_dir = CONFIG.saved_ckpt_location()
+        prefix_to_delete = f"{self._name}_"
+        logger.info(f"训练开始前，清理前缀为 '{prefix_to_delete}' 的旧模型...")
+        try:
+            # 确保目录存在
+            if not os.path.exists(save_dir):
+                logger.warning(f"检查点目录 {save_dir} 不存在，无需清理。")
+                return
+            
+            for filename in os.listdir(save_dir):
+                if filename.startswith(prefix_to_delete):
+                    file_path_to_delete = os.path.join(save_dir, filename)
+                    os.remove(file_path_to_delete)
+                    logger.info(f"已删除旧模型: {file_path_to_delete}")
+        except Exception as e:
+            logger.error(f"删除旧模型时出错: {e}")
     
     # ===== 原有方法 =====
 
@@ -287,21 +306,8 @@ class ContrastiveTrainer(AbstractTrainer):
         - 训练时使用 use_text_modality=True（双模态门控融合）
         - 验证时通过 _get_logits_and_real 自动使用 use_text_modality=False（纯声学）
         """
-        # --- 新增逻辑：在训练开始前，清理旧的检查点 ---
-        save_dir = CONFIG.saved_ckpt_location()
-        prefix_to_delete = f"{self._name}_"
-        logger.info(f"训练开始前，清理前缀为 '{prefix_to_delete}' 的旧模型...")
-        try:
-            for filename in os.listdir(save_dir):
-                if filename.startswith(prefix_to_delete):
-                    file_path_to_delete = os.path.join(save_dir, filename)
-                    os.remove(file_path_to_delete)
-                    logger.info(f"已删除旧模型: {file_path_to_delete}")
-        except FileNotFoundError:
-            logger.warning(f"检查点目录 {save_dir} 不存在，无需清理。")
-        except Exception as e:
-            logger.error(f"删除旧模型时出错: {e}")
-        # ------------------------------------------  
+        # --- [重构] 调用封装的方法来清理旧检查点 ---
+        self._cleanup_old_checkpoints()
         
         # 初始化学习率调度器
         self.scheduler = self._initialize_training(train_dataloader)
@@ -437,6 +443,9 @@ class AblationNoLabelTrainer(ContrastiveTrainer):
         重写核心的训练方法以适应无监督对比损失。
         大部分逻辑与父类相同，仅修改损失计算部分。
         """
+        # --- [重构] 调用封装的方法来清理旧检查点 ---
+        self._cleanup_old_checkpoints()
+
         # 初始化学习率调度器
         self.scheduler = self._initialize_training(train_dataloader)
 
@@ -452,7 +461,8 @@ class AblationNoLabelTrainer(ContrastiveTrainer):
 
             for step, batch in enumerate(loader):
                 try:
-                    acoustic_embedding, text_embedding, audio_logits, augmented_acoustic_embedding, labels = self._get_outputs_and_labels(batch)
+                    acoustic_embedding, text_embedding, audio_logits, augmented_acoustic_embedding, labels = self._get_outputs_and_labels(
+                        batch, use_text_modality=True)  # 训练时使用双模态融合
 
                     with torch.amp.autocast('cuda', dtype=torch.bfloat16):
                         # 1. 分类损失的计算方式保持不变
@@ -603,7 +613,7 @@ class AblationNoTextTrainer(ContrastiveTrainer):
         return embedding_1, embedding_2, audio_logits, labels
 
     # 步骤 3: 重写验证阶段的"桥梁"方法，以适配纯声学模型
-    def _get_logits_and_real(self, batch: dict) -> (torch.Tensor, torch.Tensor):
+    def _get_logits_and_real(self, batch: dict) -> tuple[torch.Tensor, torch.Tensor]:
         """
         [核心修改] 为评估阶段重写此方法。
         该方法遵循“测试时单模态”的原则。
@@ -629,6 +639,9 @@ class AblationNoTextTrainer(ContrastiveTrainer):
         [核心修改] 重写核心训练方法，以适配新的损失计算逻辑。
         大部分代码结构与父类 `ContrastiveTrainer.train` 相同。
         """
+        # --- [重构] 调用封装的方法来清理旧检查点 ---
+        self._cleanup_old_checkpoints()
+
         # 初始化学习率调度器
         self.scheduler = self._initialize_training(train_dataloader)
         

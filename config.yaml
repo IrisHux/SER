@@ -24,7 +24,7 @@ dataset_specific:
 dataloader:
   batch_size: 8
   num_workers: 4
-  shuffle: false # Set to false for tsne visualization consistency
+  # shuffle: False # Set to false for tsne visualization consistency
 
 models:
   # 模型保存目录，相对于 project_root
