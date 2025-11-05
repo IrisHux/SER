@@ -96,10 +96,10 @@ def run_experiment():
     cremad_emotions = CONFIG.dataset_emotions(evaluation_dataset_name)
 
     logging.info(f"--- 在 '{training_dataset_name}' 验证集上进行评估 ---")
-    trainer.eval(validation_loader, labels=iemocap_emotions)
+    val_uar, val_war, _ = trainer.eval(validation_loader, labels=iemocap_emotions)
 
     logging.info(f"--- 在 '{evaluation_dataset_name}' 测试集上进行零样本评估 ---")
-    trainer.eval(evaluation_loader, labels=cremad_emotions)
+    test_uar, test_war, _ = trainer.eval(evaluation_loader, labels=cremad_emotions)
 
     logging.info("--- 实验流程全部完成！ ---")
 

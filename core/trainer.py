@@ -161,4 +161,4 @@ class AbstractTrainer:
             conf_matrix, possible_labels, filename=f"{self._name}-conf_matrix{filename_suffix}.png"
         )
 
-        return uar, war # <--- 新增：返回计算出的指标
+        return uar, war, conf_matrix # <--- 返回三个值：UAR, WAR, 混淆矩阵

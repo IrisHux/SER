@@ -156,7 +156,7 @@ def get_ablation_no_text_dataloaders(dataset_name: str) -> Dict[str, torch.utils
     return dataloaders
 
 
-# 修改函数，使其适应新的流程
+# baseline的实时处理dataloader
 def get_dataloaders(dataset_name: str) -> Dict[str, DataLoader]:
     print(f"--- 正在为数据集 '{dataset_name}' 准备Dataloaders (实时处理模式) ---")
 

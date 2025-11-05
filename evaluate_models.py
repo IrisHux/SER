@@ -66,7 +66,7 @@ def main():
     )
 
     print("开始在目标数据集上进行评估...")
-    evaluator.eval(eval_loader, labels=CONFIG.dataset_emotions(args.dataset_name))
+    uar, war, conf_matrix = evaluator.eval(eval_loader, labels=CONFIG.dataset_emotions(args.dataset_name))
 
     print(f"--- [评估完成] 模型类型: {args.model_type}, 数据集: {args.dataset_name} ---")
 
