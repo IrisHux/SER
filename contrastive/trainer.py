@@ -228,7 +228,7 @@ class ContrastiveTrainer(AbstractTrainer):
 
         # 使用混合精度进行前向传播
         with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-            acoustic_embedding, text_embedding, audio_logits, augmented_acoustic_embedding = self.model(
+            acoustic_embedding, text_embedding, audio_logits, augmented_acoustic_embedding, pooled_fused_features = self.model(
                 audio_input_values=audio_inputs,
                 text_input_ids=text_input_ids,
                 text_attention_mask=text_attention_mask,
@@ -255,7 +255,7 @@ class ContrastiveTrainer(AbstractTrainer):
         
         # 2. 模型前向传播（只获取 audio_logits）
         # 我们调用模型，但只关心第三个返回值
-        _, _, audio_logits, _ = self.model(
+        _, _, audio_logits, _, _ = self.model(
             audio_input_values=audio_inputs,
             text_input_ids=text_input_ids,
             text_attention_mask=text_attention_mask,

@@ -230,7 +230,11 @@ class MemoryOptimizedContrastiveModel(nn.Module):
 
         # 4. 分类
         final_logits = self.final_classifier(pooled_fused_features)
-        return acoustic_embedding, text_embedding, final_logits, augmented_acoustic_embedding
+        
+        # 返回: acoustic_embedding(对比学习), text_embedding(对比学习), 
+        #       final_logits(分类), augmented_acoustic_embedding(对比学习), 
+        #       pooled_fused_features(用于可视化分类特征)
+        return acoustic_embedding, text_embedding, final_logits, augmented_acoustic_embedding, pooled_fused_features
 
     
 

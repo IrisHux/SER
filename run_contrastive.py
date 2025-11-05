@@ -127,6 +127,25 @@ if __name__ == "__main__":
             print(f"   - 最佳测试集 UAR: {best_model_stats['test_uar']:.4f}")
             print(f"   - 对应的测试集 WAR: {best_model_stats['test_war']:.4f}")
             print("==========================================================")
+            
+            # 4. ⭐️ 新增：保存最佳模型检查点到 saved_models_location
+            try:
+                # 源文件路径（在checkpoints目录中）
+                source_checkpoint_path = os.path.join(CONFIG.saved_ckpt_location(), best_checkpoint_name)
+                # 目标文件路径（在saved_models目录中，使用新名称）
+                target_model_path = os.path.join(CONFIG.saved_models_location(), "Contrastive_LGCA_model.pt")
+                
+                logger.info(f"\n--- 正在保存最佳模型到: {target_model_path} ---")
+                
+                # 加载并保存模型（这样可以确保文件完整性）
+                best_model_state = torch.load(source_checkpoint_path, map_location=device)
+                torch.save(best_model_state, target_model_path)
+                
+                logger.info(f"✅ 最佳模型已成功保存为: Contrastive_LGCA_model.pt")
+                print(f"\n✅ 最佳模型已保存至: {target_model_path}")
+                
+            except Exception as e:
+                logger.error(f"保存最佳模型时出错: {e}")
         else:
             logger.warning("未生成评估结果。")
         logger.info("==================== [阶段 2: 评估完成] ====================")

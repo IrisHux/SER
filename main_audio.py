@@ -89,7 +89,7 @@ def main():
 
         # --- 步骤 5: 保存训练好的模型 ---
         print("\n--- [步骤 5] 保存训练好的模型 ---")
-        model_save_dir = CONFIG.saved_ckpt_location()
+        model_save_dir = CONFIG.saved_models_location()
         model_save_path = os.path.join(model_save_dir, "Audio_Baseline_trained_model.pt")
         
         # 保存模型的state_dict
