@@ -9,9 +9,10 @@ from transformers import Wav2Vec2Processor, AutoProcessor, Wav2Vec2FeatureExtrac
 from typing import Dict  # 需要添加这个导入
 
 from core.config import CONFIG
-from dataloaders.dataset import EmotionDataset, EmotionDatasetAblation
+from dataloaders.dataset import AudioDataset, EmotionDataset, EmotionDatasetAblation
 from dataloaders.collator import AudioDataCollator, AblationCollator
 from contrastive.collator import ContrastiveDataCollator
+from dataloaders.sampler import StratifiedBatchSampler
 
 def get_contrastive_dataloaders(dataset_name: str, use_audio_augmentation: bool = False)  -> Dict[str, torch.utils.data.DataLoader]:
     """
@@ -61,11 +62,32 @@ def get_contrastive_dataloaders(dataset_name: str, use_audio_augmentation: bool 
         if should_augment:
             print(f"[INFO] 已为 '{split}' 划分启用数据增强并创建 Dataset。")
 
-        dataloaders[split] = DataLoader(
-            dataset,
-            collate_fn=contrastive_collator, # <-- 使用新的双模态实时处理collator
-            **dataloader_params
-        )
+        if split == "train":
+            P = len(emotions)
+            K = CONFIG.dataloader_dict()['batch_size']// P
+
+            stratified_batch_sampler = StratifiedBatchSampler(
+                dataset=dataset,
+                num_classes_per_batch=P,
+                num_samples_per_class=K
+            )
+
+            dataloaders[split] = DataLoader(
+                dataset,
+                collate_fn=contrastive_collator,
+                batch_sampler=stratified_batch_sampler, # <-- 使用 batch_sampler
+
+                # 从 dataloader_params 中只取出多进程和内存相关的参数
+                num_workers=dataloader_params.get('num_workers', 4),
+                pin_memory=dataloader_params.get('pin_memory', True)
+            )
+
+        else:
+            dataloaders[split] = DataLoader(
+                dataset,
+                collate_fn=contrastive_collator, # <-- 使用新的双模态实时处理collator
+                **dataloader_params
+            )
 
     return dataloaders
 
@@ -154,16 +176,6 @@ def get_dataloaders(dataset_name: str) -> Dict[str, DataLoader]:
         raise e
 
     # 2. 初始化 Processor 和我们新的 Collator
-    # processor = Wav2Vec2Processor.from_pretrained(CONFIG.audio_encoder_name()) # Old code
-    # try:
-    #     # 尝试直接加载完整的 processor
-    #     processor = Wav2Vec2Processor.from_pretrained(CONFIG.audio_encoder_name())
-    # except Exception as e:
-    #     print(f"[WARNING] 无法加载完整 Wav2Vec2Processor: {e}")
-    #     # 如果失败，手动创建（虽然对于纯音频任务，tokenizer 可能为空）
-    #     feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(CONFIG.audio_encoder_name())
-    #     processor = Wav2Vec2Processor(feature_extractor=feature_extractor, tokenizer=None)
-
     processor = Wav2Vec2FeatureExtractor.from_pretrained(CONFIG.audio_encoder_name())
     print(f"[INFO] 使用的 processor 类型: {type(processor)}")
     audio_collator = AudioDataCollator(processor=processor)
@@ -176,14 +188,14 @@ def get_dataloaders(dataset_name: str) -> Dict[str, DataLoader]:
     dataloaders = {}
     if dataset_name == training_dataset_name:
         # 创建训练集 DataLoader
-        train_dataset = EmotionDataset(dataframe, dataset_name, emotions, "train")
+        train_dataset = AudioDataset(dataframe, dataset_name, emotions, "train")
         dataloaders["train"] = DataLoader(
             train_dataset,
             collate_fn=audio_collator, # 使用新的 collator
             **dataloader_params
         )
         # 创建验证集 DataLoader
-        val_dataset = EmotionDataset(dataframe, dataset_name, emotions, "validation")
+        val_dataset = AudioDataset(dataframe, dataset_name, emotions, "validation")
         dataloaders["validation"] = DataLoader(
             val_dataset,
             collate_fn=audio_collator, # 使用新的 collator
@@ -192,7 +204,7 @@ def get_dataloaders(dataset_name: str) -> Dict[str, DataLoader]:
 
     elif dataset_name == evaluation_dataset_name:
         # 创建评估集 DataLoader
-        eval_dataset = EmotionDataset(dataframe, dataset_name, emotions, "evaluation")
+        eval_dataset = AudioDataset(dataframe, dataset_name, emotions, "evaluation")
         dataloaders["evaluation"] = DataLoader(
             eval_dataset,
             collate_fn=audio_collator, # 使用新的 collator

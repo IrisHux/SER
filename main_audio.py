@@ -67,6 +67,7 @@ def main():
 
         # --- 步骤 3: 实例化模型和训练器 ---
         print("\n--- [步骤 3] 初始化基线模型和训练器 ---")
+        
         torch.cuda.empty_cache()
         gc.collect()
 
@@ -84,17 +85,66 @@ def main():
 
         # --- 步骤 4: 训练模型 ---
         print("\n--- [步骤 4] 开始在 IEMOCAP 上训练基线模型 ---")
-        # baseline_trainer.train(train_loader)
         training_history = baseline_trainer.train(train_loader, validation_loader)
 
-        # --- 步骤 5: 在 IEMOCAP 验证集上评估 ---
-        print("\n--- [步骤 5] 在 IEMOCAP 验证集上评估模型性能 ---")
-        baseline_trainer.eval(validation_loader, labels=iemocap_emotions)
+        # --- 步骤 5: 保存训练好的模型 ---
+        print("\n--- [步骤 5] 保存训练好的模型 ---")
+        model_save_dir = CONFIG.saved_ckpt_location()
+        model_save_path = os.path.join(model_save_dir, "Audio_Baseline_trained_model.pt")
+        
+        # 保存模型的state_dict
+        torch.save({
+            'model_state_dict': baseline_model.state_dict(),
+            'optimizer_state_dict': baseline_trainer._optimizer.state_dict(),
+            'training_history': training_history,
+            'num_labels': num_labels,
+            'emotions': iemocap_emotions
+        }, model_save_path)
+        print(f"模型已保存到: {model_save_path}")
 
-        # --- 步骤 6: 在 CREMA-D 测试集上进行零样本评估 ---
-        print("\n--- [步骤 6] 在 CREMA-D 测试集上进行零样本评估 ---")
+        # --- 步骤 6: 在 IEMOCAP 验证集上评估 ---
+        print("\n--- [步骤 6] 在 IEMOCAP 验证集上评估模型性能 ---")
+        iemocap_uar, iemocap_war, _ = baseline_trainer.eval(validation_loader, labels=iemocap_emotions)
+
+        # --- 步骤 7: 清理内存并加载保存的模型用于CREMA-D评估 ---
+        print("\n--- [步骤 7] 清理内存并准备在 CREMA-D 上评估 ---")
+        # 删除当前模型和训练器以释放内存
+        del baseline_model
+        del baseline_trainer
+        torch.cuda.empty_cache()
+        gc.collect()
+
+        # --- 步骤 8: 加载训练好的模型 ---
+        print("\n--- [步骤 8] 加载训练好的模型 ---")
+        checkpoint = torch.load(model_save_path, map_location=device)
+        loaded_model = AudioBaselineModel(num_labels=checkpoint['num_labels']).to(device)
+        loaded_model.load_state_dict(checkpoint['model_state_dict'])
+        print(f"模型已从 {model_save_path} 加载")
+
+        # --- 步骤 9: 在 CREMA-D 测试集上进行零样本评估 ---
+        print("\n--- [步骤 9] 在 CREMA-D 测试集上进行零样本评估 ---")
         cremad_emotions = CONFIG.dataset_emotions(evaluation_dataset_name)
-        baseline_trainer.eval(evaluation_loader, labels=cremad_emotions)
+        
+        # 创建一个用于评估的trainer（不需要训练，只需要eval方法）
+        eval_trainer = MemoryOptimizedAudioBaselineTrainer(
+            model=loaded_model,
+            num_epochs=0,  # 不进行训练
+            learning_rate=1e-4,
+            optimizer_type="Adam",
+            gradient_accumulation_steps=4
+        )
+        
+        print("开始在 CREMA-D 上评估...")
+        cremad_uar, cremad_war, _ = eval_trainer.eval(evaluation_loader, labels=cremad_emotions)
+        
+        # --- 步骤 10: 打印评估总结 ---
+        print("\n" + "="*60)
+        print("评估结果总结:")
+        print("="*60)
+        print(f"CREMA-D 数据集:")
+        print(f"  - UAR (Unweighted Average Recall): {cremad_uar:.4f}")
+        print(f"  - WAR (Weighted Average Recall/Accuracy): {cremad_war:.4f}")
+        print("="*60)
 
         print("\n--- 基线模型训练和评估完成！ ---")
 
