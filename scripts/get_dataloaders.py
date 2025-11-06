@@ -14,13 +14,11 @@ from dataloaders.collator import AudioDataCollator, AblationCollator
 from contrastive.collator import ContrastiveDataCollator
 from dataloaders.sampler import StratifiedBatchSampler
 
-def get_contrastive_dataloaders(dataset_name: str, use_audio_augmentation: bool = False)  -> Dict[str, torch.utils.data.DataLoader]:
+def get_contrastive_dataloaders(dataset_name: str)  -> Dict[str, torch.utils.data.DataLoader]:
     """
     为对比学习框架获取双模态的 Dataloaders。
     """
     print(f"--- 正在为 '{dataset_name}' 准备双模态 Dataloaders ---")
-    if use_audio_augmentation:
-        print("[INFO] 本次将为训练集启用音频数据增强。")
     # 1. 加载数据集的基础信息
     emotions = CONFIG.dataset_emotions(dataset_name)
     dataloader_params = CONFIG.dataloader_dict()
@@ -55,12 +53,7 @@ def get_contrastive_dataloaders(dataset_name: str, use_audio_augmentation: bool 
         splits = ["evaluation"]
 
     for split in splits:
-        # 仅在训练集上启用数据增强
-        should_augment = (split == "train") and use_audio_augmentation
- 
-        dataset = EmotionDataset(dataframe, dataset_name, emotions, split, use_audio_augmentation=should_augment)
-        if should_augment:
-            print(f"[INFO] 已为 '{split}' 划分启用数据增强并创建 Dataset。")
+        dataset = EmotionDataset(dataframe, dataset_name, emotions, split)
 
         if split == "train":
             P = len(emotions)
@@ -121,8 +114,7 @@ def get_ablation_no_text_dataloaders(dataset_name: str) -> Dict[str, torch.utils
     audio_processor = Wav2Vec2FeatureExtractor.from_pretrained(CONFIG.audio_encoder_name())
     print("[INFO] 音频特征提取器初始化完成。")
 
-    # 步骤 3: 实例化两种 Collator
-    ablation_collator = AblationCollator(audio_processor=audio_processor)
+    # 步骤 3: [!! 核心修改 !!] 实例化两种 Collator
     # 这个 collator 用于处理单音频输入的验证/评估集
     std_audio_collator = AudioDataCollator(processor=audio_processor)
 
@@ -135,23 +127,43 @@ def get_ablation_no_text_dataloaders(dataset_name: str) -> Dict[str, torch.utils
         splits = ["evaluation"]
 
     for split in splits:
-        # *** 实例化 EmotionDatasetAblation ***
+        # *** 实例化 EmotionDataset ***
+        dataset = EmotionDataset(dataframe, dataset_name, emotions, split)
+        collator_to_use = std_audio_collator
         if split == "train":
-            dataset = EmotionDatasetAblation(dataframe, dataset_name, emotions, split)
-            collator_to_use = ablation_collator
-            print(f"[INFO] 已为 '{split}' 划分创建 Dataloader (使用 EmotionDatasetAblation 和 AblationCollator)。")
-        else:
-            # 验证集和评估集使用标准的 Dataset 和 Collator
-            # 注意：这里我们复用 EmotionDataset，但需要确保它不返回文本，
-            dataset = EmotionDataset(dataframe, dataset_name, emotions, split)
-            collator_to_use = std_audio_collator
-            print(f"[INFO] 已为 '{split}' 划分创建 Dataloader (使用标准的 EmotionDataset 和 AudioDataCollator)。")
+            # [!! 核心修改 !!] 
+            # 训练集：必须使用 StratifiedBatchSampler
+            
+            # 1. 从 CONFIG 中获取 P 和 K
+            # (确保这些值与主模型 使用的值一致)
+            P = len(emotions)
+            K = CONFIG.dataloader_dict()['batch_size']// P
+            
+            stratified_batch_sampler = StratifiedBatchSampler(
+                dataset=dataset,
+                num_classes_per_batch=P,
+                num_samples_per_class=K
+            )
 
-        dataloaders[split] = DataLoader(
-            dataset,
-            collate_fn=collator_to_use, # 动态选择collator
-            **dataloader_params
-        )
+            # 2. 创建 DataLoader
+            #    注意：当使用 batch_sampler 时，必须禁用 batch_size, shuffle, drop_last
+            dataloaders[split] = DataLoader(
+                dataset,
+                collate_fn=collator_to_use,
+                batch_sampler=stratified_batch_sampler, # <-- [!! 核心 !!]
+                
+                num_workers=dataloader_params.get('num_workers', 4),
+                pin_memory=dataloader_params.get('pin_memory', True)
+            )
+            print(f"[INFO] 已为 '{split}' 划分创建 Dataloader (使用 StratifiedBatchSampler)。")
+        else:
+            # 验证/评估集：使用标准的 DataLoader 设置
+            dataloaders[split] = DataLoader(
+                dataset,
+                collate_fn=collator_to_use, # 动态选择collator
+                **dataloader_params
+            )
+            print(f"[INFO] 已为 '{split}' 划分创建 Dataloader（使用标准采样器）。")
 
     return dataloaders
 

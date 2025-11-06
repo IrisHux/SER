@@ -69,9 +69,8 @@ class AudioDataset(Dataset):
     
 class EmotionDataset(Dataset):
     # 修改__init__，现在只接收一个包含原始信息的DataFrame
-    def __init__(self, dataframe: pd.DataFrame, dataset_name: str, emotions: list, split: str, use_audio_augmentation: bool = False):
+    def __init__(self, dataframe: pd.DataFrame, dataset_name: str, emotions: list, split: str):
         self._emotions = np.array(emotions)
-        self.use_audio_augmentation = use_audio_augmentation
 
         # IEMOCAP需要按session和说话人性别进行划分
         # 这里简化为按情感类别进行分层抽样，与你之前的逻辑保持一致
@@ -91,14 +90,6 @@ class EmotionDataset(Dataset):
 
         logger.info(f"已加载 '{dataset_name}' 数据集用于 '{split}' 划分。大小: {len(self)}")
 
-        if self.use_audio_augmentation:
-            # 复用Ablation版本中的增强流程
-            self.augment_v1 = Compose([
-                AddGaussianNoise(min_amplitude=0.001, max_amplitude=0.015, p=0.5),
-                PitchShift(min_semitones=-2, max_semitones=2, p=0.5),
-                TimeStretch(min_rate=0.8, max_rate=1.25, p=0.5), # 可以组合更多
-            ])
-            logger.info(f"数据集 '{split}' 已启用音频数据增强。")
 
     def __getitem__(self, index: int):
         # 1. 获取音频路径和标签
@@ -127,14 +118,7 @@ class EmotionDataset(Dataset):
                 "text": text_content, # <-- 新增：返回文本，如果是纯声学模型，则把这一行注释掉
                 "label": emotion_index
             }
-
-             # *** 核心修改点：如果启用了增强，则额外生成一个增强版本 ***
-            if self.use_audio_augmentation:
-                waveform_np = waveform.squeeze().numpy()
-                augmented_waveform = self.augment_v1(samples=waveform_np, sample_rate=16000)
-                # 将增强后的数据添加到返回字典中
-                item["augmented_waveform"] = torch.from_numpy(augmented_waveform)
-            return item           
+            return item
         except Exception as e:
             logger.error(f"加载或处理音频文件 {audio_path} 时出错: {e}")
             return None

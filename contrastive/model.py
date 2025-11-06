@@ -164,7 +164,7 @@ class MemoryOptimizedContrastiveModel(nn.Module):
         mask = mask.unsqueeze(-1).type_as(tensor)
         return (tensor * mask).sum(1) / mask.sum(1).clamp_min(1e-6)
 
-    def forward(self, audio_input_values, text_input_ids, text_attention_mask, augmented_audio_input_values=None, use_text_modality=True):
+    def forward(self, audio_input_values, text_input_ids, text_attention_mask, use_text_modality=True):
         # [修复 NaN] 移除模型内部的 autocast，避免与训练器中的 autocast 嵌套
         # ==========================================================
         # 阶段 1: 独立编码
@@ -180,14 +180,6 @@ class MemoryOptimizedContrastiveModel(nn.Module):
         acoustic_embedding = self.audio_projection_head(pooled_Ha)
         # final_logits = self.audio_classifier(pooled_Ha)
 
-        # --- 增强音频分支 (新增逻辑) ---
-        augmented_acoustic_embedding = None
-        if augmented_audio_input_values is not None:
-            # 使用相同的编码器和投影头
-            aug_audio_outputs = self.audio_encoder(input_values=augmented_audio_input_values)
-            aug_acoustic_features = torch.mean(aug_audio_outputs.last_hidden_state, dim=1)
-            augmented_acoustic_embedding = self.audio_projection_head(aug_acoustic_features)
-            # 注意：这里没有分类头，因为增强音频主要用于对比学习
         # 文本分支
         text_embedding = None
         Hb_sequence = None
@@ -231,10 +223,12 @@ class MemoryOptimizedContrastiveModel(nn.Module):
         # 4. 分类
         final_logits = self.final_classifier(pooled_fused_features)
         
-        # 返回: acoustic_embedding(对比学习), text_embedding(对比学习), 
-        #       final_logits(分类), augmented_acoustic_embedding(对比学习), 
-        #       pooled_fused_features(用于可视化分类特征)
-        return acoustic_embedding, text_embedding, final_logits, augmented_acoustic_embedding, pooled_fused_features
+        # 返回4个值:
+        # 1. acoustic_embedding: 对比学习的声学嵌入 (投影头输出)
+        # 2. text_embedding: 对比学习的文本嵌入 (投影头输出)
+        # 3. final_logits: 分类logits
+        # 4. pooled_fused_features: 门控融合后的分类特征 (用于可视化)
+        return acoustic_embedding, text_embedding, final_logits, pooled_fused_features
 
     
 
@@ -271,7 +265,7 @@ class AcousticSupConModel(nn.Module):
         # --- 3. 仍然需要分类头 ---
         self.audio_classifier = nn.Linear(audio_hidden_size, num_labels)
 
-    def forward(self, audio_input_1, audio_input_2):
+    def forward(self, audio_input_1):
         """
         前向传播接收两个增强版本的音频输入。
         """
@@ -284,12 +278,4 @@ class AcousticSupConModel(nn.Module):
         # 通常只使用一个视图（例如第一个）的特征来做分类，以保持稳定性
         logits = self.audio_classifier(features_1)
 
-        if audio_input_2 is not None: # 仅在训练时
-            outputs_2 = self.audio_encoder(input_values=audio_input_2)
-            features_2 = torch.mean(outputs_2.last_hidden_state, dim=1)
-            embedding_2 = self.audio_projection_head(features_2)
-            return embedding_1, embedding_2, logits
-        else:
-            # --- 评估模式 ---
-            # 只返回 logits，其他两个返回 None 以匹配训练时的输出元组结构
-            return None, None, logits
+        return embedding_1, logits

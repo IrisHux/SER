@@ -34,7 +34,7 @@ class AbstractTrainer:
         self._name = name
         self._alpha = alpha
 
-    def _get_logits_and_real(self, batch) -> (torch.Tensor, torch.Tensor):
+    def _get_logits_and_real(self, batch) -> tuple[torch.Tensor, torch.Tensor]:
         # 这是一个待实现的抽象方法。
         # 它的任务是从一个数据批次（batch）中，提取出模型的输入数据，并返回模型的原始输出（logits）和真实标签（real）。
         pass

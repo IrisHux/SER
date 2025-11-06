@@ -56,17 +56,15 @@ def extract_lgca_features(dataloader, model, device):
             labels = batch['labels'].to(device)
 
             # 2. 前向传播
-            # 根据更新后的 model.py，forward 现在返回5个值：
+            # 根据更新后的 model.py，forward 现在返回4个值：
             # acoustic_embedding: 对比学习的声学嵌入 (投影头输出)
             # text_embedding: 对比学习的文本嵌入 (投影头输出)
             # final_logits: 分类logits
-            # augmented_acoustic_embedding: 增强音频的嵌入
             # pooled_fused_features: 门控融合后的分类特征 (用于情绪分类可视化)
-            _, _, _, _, pooled_fused_features = model(
+            _, _, _, pooled_fused_features = model(
                 audio_input_values=audio_input,
                 text_input_ids=text_input,
                 text_attention_mask=mask,
-                augmented_audio_input_values=None,
                 use_text_modality=False  # 评估时使用单模态 (纯声学)
             )
 

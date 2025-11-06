@@ -39,18 +39,6 @@ class ContrastiveDataCollator:
             max_length=16000 * SECONDES # 限制最大长度为6秒
         )
 
-        # *** 如果存在增强数据，则同样处理它 ***
-        augmented_audio_inputs = None
-        if has_augmentation:
-            augmented_waveforms = [item["augmented_waveform"].numpy() for item in batch]
-            augmented_audio_inputs = self.audio_processor(
-                augmented_waveforms,
-                sampling_rate=16000,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=16000 * SECONDES
-            )
             
         # 4. 实时处理文本
         text_inputs = self.text_tokenizer(
@@ -71,9 +59,5 @@ class ContrastiveDataCollator:
             "text_attention_mask": text_inputs.attention_mask,
             "labels": labels_batch
         }
-
-        # 如果存在增强数据，则将其添加到模型输入中
-        if has_augmentation:
-            model_inputs["augmented_audio_input_values"] = augmented_audio_inputs.input_values
 
         return model_inputs

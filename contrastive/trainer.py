@@ -222,21 +222,16 @@ class ContrastiveTrainer(AbstractTrainer):
         text_attention_mask = batch['text_attention_mask'].to(device, non_blocking=True)
         labels = batch['labels'].to(device, non_blocking=True)
 
-        augmented_audio_inputs = batch.get('augmented_audio_input_values')
-        if augmented_audio_inputs is not None:
-            augmented_audio_inputs = augmented_audio_inputs.to(device, non_blocking=True)
-
         # 使用混合精度进行前向传播
         with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-            acoustic_embedding, text_embedding, audio_logits, augmented_acoustic_embedding, pooled_fused_features = self.model(
+            acoustic_embedding, text_embedding, audio_logits, pooled_fused_features = self.model(
                 audio_input_values=audio_inputs,
                 text_input_ids=text_input_ids,
                 text_attention_mask=text_attention_mask,
-                augmented_audio_input_values=augmented_audio_inputs,
                 use_text_modality=use_text_modality  # 控制是否使用文本模态
             )
 
-        return acoustic_embedding, text_embedding, audio_logits, augmented_acoustic_embedding, labels
+        return acoustic_embedding, text_embedding, audio_logits, labels
 
     # --- *** 新增这个用于评估的方法 *** ---
     def _get_logits_and_real(self, batch: dict) -> tuple[torch.Tensor, torch.Tensor]:
@@ -255,11 +250,10 @@ class ContrastiveTrainer(AbstractTrainer):
         
         # 2. 模型前向传播（只获取 audio_logits）
         # 我们调用模型，但只关心第三个返回值
-        _, _, audio_logits, _, _ = self.model(
+        _, _, audio_logits, _ = self.model(
             audio_input_values=audio_inputs,
             text_input_ids=text_input_ids,
             text_attention_mask=text_attention_mask,
-            augmented_audio_input_values=None,
             use_text_modality=False  # <-- 关键修改：不使用文本模态
         )
         
@@ -328,18 +322,14 @@ class ContrastiveTrainer(AbstractTrainer):
             for step, batch in enumerate(loader):
                 try:
                     # --- 2. 前向传播与损失计算 ---
-                    acoustic_embedding, text_embedding, audio_logits, augmented_acoustic_embedding, labels = self._get_outputs_and_labels(
+                    acoustic_embedding, text_embedding, audio_logits, labels = self._get_outputs_and_labels(
                         batch, use_text_modality=True)  # 训练时使用双模态融合
 
                     with torch.amp.autocast('cuda', dtype=torch.bfloat16):
                         loss_inter_contrastive = self.sup_con_loss(acoustic_embedding, text_embedding, labels) # 计算监督对比损失
                         loss_ce = self.cross_entropy_loss(audio_logits, labels) # 计算交叉熵损失
 
-                        loss_intra_contrastive = 0
-                        if augmented_acoustic_embedding is not None:
-                            loss_intra_contrastive = self.sup_con_loss(acoustic_embedding, augmented_acoustic_embedding, labels)
-
-                        total_loss = self.alpha * (loss_inter_contrastive + loss_intra_contrastive) + loss_ce # 根据 alpha 加权组合损失
+                        total_loss = self.alpha * (loss_inter_contrastive) + loss_ce # 根据 alpha 加权组合损失
                         scaled_loss = total_loss / self.gradient_accumulation_steps # 用于梯度累积的损失缩放
 
                     # --- 3. 反向传播 ---
@@ -374,13 +364,12 @@ class ContrastiveTrainer(AbstractTrainer):
                     # 梯度累积步骤
                     if self._perform_optimization_step(step):
                         # 更新进度条显示
-                        loss_intra_val = loss_intra_contrastive.item() if torch.is_tensor(loss_intra_contrastive) else loss_intra_contrastive
+
                         loader.set_postfix(
                             loss=total_loss.item(), 
                             acc=accuracy.item(), 
                             ce=loss_ce.item(), 
                             inter_con=loss_inter_contrastive.item(), # 跨模态对比损失
-                            intra_con=loss_intra_val              # 模态内对比损失
                         )
 
                     # 清理内存
@@ -461,7 +450,7 @@ class AblationNoLabelTrainer(ContrastiveTrainer):
 
             for step, batch in enumerate(loader):
                 try:
-                    acoustic_embedding, text_embedding, audio_logits, augmented_acoustic_embedding, labels = self._get_outputs_and_labels(
+                    acoustic_embedding, text_embedding, audio_logits, labels = self._get_outputs_and_labels(
                         batch, use_text_modality=True)  # 训练时使用双模态融合
 
                     with torch.amp.autocast('cuda', dtype=torch.bfloat16):
@@ -474,14 +463,9 @@ class AblationNoLabelTrainer(ContrastiveTrainer):
                         # a. 跨模态损失 (Audio-Text)
                         #    直接传入两个视图，不再需要手动创建标签
                         loss_inter_contrastive = self.contrastive_loss(acoustic_embedding, text_embedding)
-                        
-                        # b. 模态内损失 (Audio-Audio_Augmented)
-                        loss_intra_contrastive = 0
-                        if augmented_acoustic_embedding is not None:
-                            # 同样直接传入两个视图
-                            loss_intra_contrastive = self.contrastive_loss(acoustic_embedding, augmented_acoustic_embedding)                        
+                                             
                         # 3. 计算总损失，保持公平的结构
-                        total_loss = self.alpha * (loss_inter_contrastive + loss_intra_contrastive) + loss_ce
+                        total_loss = self.alpha * loss_inter_contrastive + loss_ce
                         scaled_loss = total_loss / self.gradient_accumulation_steps
 
                     self.scaler.scale(scaled_loss).backward()
@@ -494,10 +478,9 @@ class AblationNoLabelTrainer(ContrastiveTrainer):
 
                     if self._perform_optimization_step(step):
                         # 更新进度条显示
-                        loss_intra_val = loss_intra_contrastive.item() if torch.is_tensor(loss_intra_contrastive) else loss_intra_contrastive
                         loader.set_postfix(
                             loss=total_loss.item(), acc=accuracy.item(), ce=loss_ce.item(), 
-                            inter_con=loss_inter_contrastive.item(), intra_con=loss_intra_val
+                            inter_con=loss_inter_contrastive.item()
                         )
 
                     self._cleanup_memory(step)
@@ -597,20 +580,18 @@ class AblationNoTextTrainer(ContrastiveTrainer):
         [核心修改] 重写此辅助方法，以处理新的双音频输入批次。
         这个方法是连接 Dataloader 和 Model 的关键桥梁。
         """
-        # 从批次中解包两个增强后的音频视图和标签
-        audio_inputs_1 = batch['audio_input_1'].to(device, non_blocking=True)
-        audio_inputs_2 = batch['audio_input_2'].to(device, non_blocking=True)
+        # 从批次中解包音频视图和标签
+        audio_inputs = batch['audio_input_values'].to(device, non_blocking=True)
         labels = batch['labels'].to(device, non_blocking=True)
 
         # 使用混合精度进行前向传播
         # self.model 在这里是 AcousticSupConModel 的一个实例
         with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-            embedding_1, embedding_2, audio_logits = self.model(
-                audio_input_1=audio_inputs_1,
-                audio_input_2=audio_inputs_2
+            embeddings, audio_logits = self.model(
+                audio_input_1=audio_inputs
             )
 
-        return embedding_1, embedding_2, audio_logits, labels
+        return embeddings, audio_logits, labels
 
     # 步骤 3: 重写验证阶段的"桥梁"方法，以适配纯声学模型
     def _get_logits_and_real(self, batch: dict) -> tuple[torch.Tensor, torch.Tensor]:
@@ -626,9 +607,8 @@ class AblationNoTextTrainer(ContrastiveTrainer):
         # 2. 模型前向传播（只获取 audio_logits）
         #    我们调用模型，但只关心第三个返回值。
         #    AcousticSupConModel 的 forward 方法设计为用第一个输入计算 logits。
-        _, _, audio_logits = self.model(
-            audio_input_1=audio_inputs,
-            audio_input_2=None
+        _, audio_logits = self.model(
+            audio_input_1=audio_inputs
         )
 
         # 3. 返回 eval 方法期望的两个值
@@ -658,12 +638,12 @@ class AblationNoTextTrainer(ContrastiveTrainer):
             for step, batch in enumerate(loader):
                 try:
                     # 1. 前向传播: 调用我们重写过的 _get_outputs_and_labels
-                    embedding_1, embedding_2, audio_logits, labels = self._get_outputs_and_labels(batch)
+                    embeddings, audio_logits, labels = self._get_outputs_and_labels(batch)
 
                     with torch.amp.autocast('cuda', dtype=torch.bfloat16):
                         # 2. 计算损失 [逻辑修改点]
                         #    将两个声学嵌入送入 SupConLoss
-                        loss_sup_con = self.sup_con_loss(embedding_1, embedding_2, labels)
+                        loss_sup_con = self.sup_con_loss(embeddings, None, labels)
 
                         #    交叉熵损失计算方式不变
                         loss_ce = self.cross_entropy_loss(audio_logits, labels)
