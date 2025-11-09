@@ -11,8 +11,10 @@ import warnings
 # 导入您项目中的核心模块
 from core.config import CONFIG, device
 from vizualisers.plots import PlotVisualizer
-from contrastive.model import setup_memory_optimization
-from scripts.contrastive_ops import ContrastiveOps # 导入我们新创建的类
+from contrastive.model import setup_memory_optimization, MemoryOptimizedContrastiveModel
+from contrastive.trainer import ContrastiveTrainer
+from scripts.contrastive_ops import ModelOps  # 使用新的通用类
+from scripts.get_dataloaders import get_contrastive_dataloaders
 
 # 配置日志记录
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -24,6 +26,7 @@ def prepare_env():
     加载配置、设置随机种子并准备环境。
     """
     warnings.filterwarnings("ignore", category=UserWarning)
+    warnings.filterwarnings("ignore", category=FutureWarning)
     
     # --- 1. 加载配置 ---
     try:
@@ -65,18 +68,38 @@ if __name__ == "__main__":
     # (对应 main_contrastive.py)
     if RUN_TRAINING:
         logger.info("\n==================== [阶段 1: 开始训练] ====================")
-        # 1.1. 创建一个新模型
-        model = ContrastiveOps.create_or_load_model()
         
-        # 1.2. 为模型创建训练器
-        trainer = ContrastiveOps.create_trainer(model)
+        # 获取配置参数
+        training_dataset_name = CONFIG.training_dataset_name()
+        num_labels = len(CONFIG.dataset_emotions(training_dataset_name))
         
-        # 1.3. 运行训练 (这会训练、验证并保存检查点)
-        ContrastiveOps.train(trainer)
+        # 1.1. 创建一个新模型（使用 ModelOps）
+        model = ModelOps.create_or_load_model(
+            model_class=MemoryOptimizedContrastiveModel,
+            num_labels=num_labels
+        )
         
-        # 1.4. (可选) 在训练完成后，立即在验证集上运行一次最终评估
+        # 1.2. 为模型创建训练器（使用 ModelOps）
+        trainer = ModelOps.create_trainer(
+            trainer_class=ContrastiveTrainer,
+            model=model
+        )
+        
+        # 1.3. 运行训练（使用 ModelOps）
+        ModelOps.train(
+            trainer=trainer,
+            training_dataset_name=training_dataset_name,
+            dataloader_func=get_contrastive_dataloaders
+        )
+        
+        # 1.4. 训练完成后，立即在验证集上运行一次最终评估
         logger.info("--- 对训练完成的最终模型在验证集上进行评估 ---")
-        ContrastiveOps.evaluate(trainer, dataset_split='validation')
+        ModelOps.evaluate(
+            trainer=trainer,
+            dataset_split='validation',
+            dataset_name=training_dataset_name,
+            dataloader_func=get_contrastive_dataloaders
+        )
         logger.info("==================== [阶段 1: 训练完成] ====================\n")
 
 
@@ -84,9 +107,20 @@ if __name__ == "__main__":
     # (对应 evaluate_checkpoints.py)
     if RUN_EVALUATE_ALL_CHECKPOINTS:
         logger.info("\n==================== [阶段 2: 评估所有检查点] ====================")
-        # 2.1. 运行批量评估
-        eval_dataset_name = CONFIG.evaluation_dataset_name()
-        results_df, best_cm, eval_labels = ContrastiveOps.evaluate_all_checkpoints(eval_dataset_name)
+        
+        # 获取配置参数
+        training_dataset_name = CONFIG.training_dataset_name()
+        evaluation_dataset_name = CONFIG.evaluation_dataset_name()
+        
+        # 2.1. 运行批量评估（使用 ModelOps）
+        results_df, best_cm, eval_labels = ModelOps.evaluate_all_checkpoints(
+            model_class=MemoryOptimizedContrastiveModel,
+            trainer_class=ContrastiveTrainer,
+            checkpoint_pattern='Contrastive_LGCA_model_epoch_*.pt',
+            training_dataset_name=training_dataset_name,
+            evaluation_dataset_name=evaluation_dataset_name,
+            dataloader_func=get_contrastive_dataloaders
+        )
         
         # 2.2. 保存和打印结果
         if results_df is not None and not results_df.empty:
@@ -101,23 +135,22 @@ if __name__ == "__main__":
             best_model_stats = results_df.iloc[0]
             best_checkpoint_name = best_model_stats['checkpoint']
 
-            # 3. ⭐️ 新增：保存最佳模型的混淆矩阵
-            plot_filename = ""
+            # 3. ⭐️ 保存最佳模型的混淆矩阵
             if best_cm is not None:
                 plot_filename = f"best_model_cm_{best_checkpoint_name.replace('.pt', '.png')}"
-                best_plot_save_path = os.path.join(CONFIG.save_tables_location(), plot_filename)
+                best_plot_save_path = os.path.join(CONFIG.save_plots_location(), plot_filename)
                 
                 logger.info(f"\n--- 正在为最佳模型 '{best_checkpoint_name}' 保存混淆矩阵 ---")
                 
                 try:
-                    # 直接使用 PlotVisualizer 来绘制混淆矩阵
+                    # 使用 PlotVisualizer 绘制混淆矩阵（会自动保存到 pictures/ 目录）
                     PlotVisualizer.plot_confusion_matrix(
                         confusion_matrix=best_cm,
                         labels=eval_labels,
                         filename=plot_filename
                     )
                     
-                    logger.info(f"--- 最佳模型的混淆矩阵已保存至: {best_plot_save_path} ---")
+                    logger.info(f"✅ 最佳模型的混淆矩阵已保存至: {best_plot_save_path}")
                 
                 except Exception as e:
                     logger.error(f"为最佳模型保存混淆矩阵时出错: {e}")

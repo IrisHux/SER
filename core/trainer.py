@@ -134,9 +134,12 @@ class AbstractTrainer:
                 y_pred += preds.cpu().numpy().tolist()
 
         possible_values = sorted({*y_actual, *y_pred})
-        possible_labels = [
-            label for i, label in enumerate(labels) if i in possible_values
-        ]
+        if labels:
+            possible_labels = [
+                label for i, label in enumerate(labels) if i in possible_values
+            ]
+        else:
+            possible_labels = [str(v) for v in possible_values]
         if len(possible_labels) < len(possible_values):
             possible_labels += ["unknown"] * (
                 len(possible_values) - len(possible_labels)

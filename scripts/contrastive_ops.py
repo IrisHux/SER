@@ -1,226 +1,385 @@
 # contrastive_ops.py
 
+"""
+通用的模型操作工具类
+提供模型创建、加载、训练、评估等通用功能
+支持主模型和消融实验模型
+"""
+
 import torch
 import gc
 import os
 import logging
 import numpy as np
 import pandas as pd
+from pathlib import Path
 from tqdm import tqdm
+from typing import Union, Tuple, Optional, List, Callable
 
 # 导入您项目中的核心模块
 from core.config import CONFIG, device
-from contrastive.model import MemoryOptimizedContrastiveModel
-from contrastive.trainer import ContrastiveTrainer
-from scripts.get_dataloaders import get_contrastive_dataloaders
+from contrastive.model import MemoryOptimizedContrastiveModel, AcousticSupConModel
+from contrastive.trainer import ContrastiveTrainer, AblationNoLabelTrainer, AblationNoTextTrainer
+from scripts.get_dataloaders import get_contrastive_dataloaders, get_ablation_no_text_dataloaders
 
 logger = logging.getLogger(__name__)
 
-class ContrastiveOps:
+class ModelOps:
     """
-    封装所有与 ContrastiveModel 相关的创建、训练和评估操作。
+    通用的模型操作工具类
+    封装模型创建、加载、训练和评估等通用操作
+    支持主模型和消融实验模型
     """
 
     @classmethod
-    def create_or_load_model(cls, load_path: str = None) -> MemoryOptimizedContrastiveModel:
+    def create_or_load_model(
+        cls, 
+        model_class: type,
+        num_labels: int,
+        checkpoint_path: Optional[str] = None
+    ) -> Union[MemoryOptimizedContrastiveModel, AcousticSupConModel]:
         """
-        创建新模型或从 state_dict 加载模型。
+        创建新模型或从检查点加载模型（通用方法）
         
         Args:
-            load_path (str, optional):
-                要加载的检查点文件名 (例如 'contrastive_lgca_epoch_5.pt')。
-                它将在 CONFIG.saved_ckpt_location() 目录中查找。
+            model_class: 模型类 (例如 MemoryOptimizedContrastiveModel 或 AcousticSupConModel)
+            num_labels: 情感类别数量
+            checkpoint_path: 检查点文件的完整路径 (可选)
+        
+        Returns:
+            初始化（或加载）后的模型实例
         """
-        # 总是需要 num_labels 来初始化模型结构
-        training_dataset_name = CONFIG.training_dataset_name()
-        num_labels = len(CONFIG.dataset_emotions(training_dataset_name))
+        # 创建模型实例
+        model = model_class(num_labels=num_labels).to(device)
         
-        model = MemoryOptimizedContrastiveModel(num_labels=num_labels).to(device)
-        
-        if load_path:
-            full_path = os.path.join(CONFIG.saved_ckpt_location(), load_path)
-            if not os.path.exists(full_path):
-                logger.error(f"错误：找不到检查点文件 {full_path}")
-                raise FileNotFoundError(f"找不到检查点文件 {full_path}")
+        if checkpoint_path:
+            if not os.path.exists(checkpoint_path):
+                logger.error(f"错误：找不到检查点文件 {checkpoint_path}")
+                raise FileNotFoundError(f"找不到检查点文件 {checkpoint_path}")
                 
-            logger.info(f"--- 正在从 {full_path} 加载模型权重 ---")
-            model.load_state_dict(torch.load(full_path, map_location=device))
+            logger.info(f"--- 正在从 {checkpoint_path} 加载模型权重 ---")
+            model.load_state_dict(torch.load(checkpoint_path, map_location=device))
         else:
-            logger.info("--- 正在创建新的 MemoryOptimizedContrastiveModel ---")
+            logger.info(f"--- 正在创建新的 {model_class.__name__} ---")
             
         return model
 
     @classmethod
-    def create_trainer(cls, model: MemoryOptimizedContrastiveModel) -> ContrastiveTrainer:
+    def create_trainer(
+        cls, 
+        trainer_class: type,
+        model: Union[MemoryOptimizedContrastiveModel, AcousticSupConModel],
+        alpha: Optional[float] = None
+    ) -> Union[ContrastiveTrainer, AblationNoLabelTrainer, AblationNoTextTrainer]:
         """
-        根据 CONFIG 配置创建一个 ContrastiveTrainer 实例。
+        根据配置创建训练器实例（通用方法）
         
         Args:
-            model (MemoryOptimizedContrastiveModel):
-                要训练或评估的模型实例。
+            trainer_class: 训练器类 (例如 ContrastiveTrainer, AblationNoLabelTrainer)
+            model: 模型实例
+            alpha: 损失权重系数 (可选，如果为 None 则从 config 读取)
+        
+        Returns:
+            训练器实例
         """
-        logger.info("--- 正在初始化 ContrastiveTrainer ---")
-        trainer = ContrastiveTrainer(
+        if alpha is None:
+            alpha = CONFIG.llgca_loss_alpha()
+            
+        logger.info(f"--- 正在初始化 {trainer_class.__name__} (alpha={alpha}) ---")
+        trainer = trainer_class(
             model=model,
             num_epochs=CONFIG.training_epochs(),
             learning_rate=CONFIG.learning_rate(),
-            alpha=CONFIG.llgca_loss_alpha(),
+            alpha=alpha,
             optimizer_type=CONFIG.optimizer_type(),
-            gradient_accumulation_steps=2 # 您可以将其也移至 config.yaml
+            gradient_accumulation_steps=4
         )
         return trainer
 
     @classmethod
-    def train(cls, trainer: ContrastiveTrainer):
+    def train(
+        cls,
+        trainer: Union[ContrastiveTrainer, AblationNoLabelTrainer, AblationNoTextTrainer],
+        training_dataset_name: str,
+        dataloader_func: Callable = get_contrastive_dataloaders
+    ):
         """
-        使用 'train' 和 'validation' 数据集运行训练过程。
+        通用的训练方法
+        
+        Args:
+            trainer: 训练器实例
+            training_dataset_name: 训练数据集名称
+            dataloader_func: 数据加载器函数
         """
-        training_dataset_name = CONFIG.training_dataset_name()
         logger.info(f"--- 正在为训练集 '{training_dataset_name}' 准备 Dataloaders ---")
         try:
-            iemocap_loaders = get_contrastive_dataloaders(
-                training_dataset_name, 
-                use_audio_augmentation=True #是否使用数据增强
-            )
-            train_loader = iemocap_loaders['train']
-            validation_loader = iemocap_loaders['validation']
+            loaders = dataloader_func(training_dataset_name)
+            train_loader = loaders['train']
+            validation_loader = loaders['validation']
         except Exception as e:
             logger.error(f"数据加载失败: {e}")
             return
 
         logger.info(f"--- 开始在 '{training_dataset_name}' 上进行训练，共 {trainer._num_epochs} 个 Epochs ---")
-        # 假设 trainer.train 会处理训练、验证循环和模型保存
         trainer.train(train_loader, validation_loader) 
         logger.info("--- 训练完成 ---")
 
     @classmethod
-    def evaluate(cls, trainer: ContrastiveTrainer, dataset_split: str):
+    def evaluate(
+        cls,
+        trainer: Union[ContrastiveTrainer, AblationNoLabelTrainer, AblationNoTextTrainer],
+        dataset_split: str,
+        dataset_name: str,
+        dataloader_func: Callable = get_contrastive_dataloaders
+    ) -> Tuple[float, float, np.ndarray]:
         """
-        在指定的数据集拆分上评估模型 (例如 'validation' 或 'evaluation')。
-
+        通用的单次评估方法
+        
         Args:
-            trainer (ContrastiveTrainer): 包含要评估的模型的训练器。
-            dataset_split (str): 'validation' 或 'evaluation'。
+            trainer: 训练器实例
+            dataset_split: 数据集拆分 ('train', 'validation', 'test', 'evaluation')
+            dataset_name: 数据集名称
+            dataloader_func: 数据加载器函数
             
         Returns:
-            tuple: (uar, war)
+            Tuple[float, float, np.ndarray]: (uar, war, confusion_matrix)
         """
-        if dataset_split == 'validation':
-            dataset_name = CONFIG.training_dataset_name()
-        elif dataset_split == 'evaluation':
-            dataset_name = CONFIG.evaluation_dataset_name()
-        else:
-            logger.error(f"未知的 dataset_split: {dataset_split}")
-            return None, None
-
         logger.info(f"--- 正在为 '{dataset_name}' 的 '{dataset_split}' 拆分准备 Dataloader ---")
         try:
-            loaders = get_contrastive_dataloaders(dataset_name)
+            loaders = dataloader_func(dataset_name)
             loader = loaders[dataset_split]
             emotions = CONFIG.dataset_emotions(dataset_name)
         except Exception as e:
             logger.error(f"数据加载失败: {e}")
-            return None, None
+            return None, None, None
 
         logger.info(f"--- 正在 '{dataset_split}' 拆分上评估模型 ---")
-        # eval 返回 (uar, war, conf_matrix)
-        uar, war, conf_matrix = trainer.eval(loader, labels=emotions)
-        logger.info(f"评估结果 ({dataset_split}) - UAR: {uar:.4f}, WAR: {war:.4f}")
-        return uar, war
+        uar, war, conf_matrix = trainer.eval(loader)
+        logger.info(f"评估结果 ({dataset_split}) - UAR: {uar:.2f}%, WAR: {war:.2f}%")
+        return uar, war, conf_matrix
 
     @classmethod
-    def evaluate_all_checkpoints(cls, evaluation_dataset_name: str) -> pd.DataFrame:
+    def evaluate_all_checkpoints(
+        cls,
+        model_class: type,
+        trainer_class: type,
+        checkpoint_pattern: str,
+        training_dataset_name: str,
+        evaluation_dataset_name: str,
+        dataloader_func: Callable = get_contrastive_dataloaders,
+        alpha: Optional[float] = None
+    ) -> Tuple[pd.DataFrame, np.ndarray, List[str]]:
         """
-        加载 'checkpoints/' 目录下的所有模型，并在测试集 (evaluation) 上进行评估。
+        通用的检查点批量评估方法
         
         Args:
-            evaluation_dataset_name (str): 在 config 中定义的评估数据集的名称。
+            model_class: 模型类 (例如 MemoryOptimizedContrastiveModel)
+            trainer_class: 训练器类 (例如 ContrastiveTrainer)
+            checkpoint_pattern: 检查点文件名匹配模式 (例如 'Contrastive_LGCA_model_epoch_*.pt')
+            training_dataset_name: 训练数据集名称（用于获取类别数）
+            evaluation_dataset_name: 评估数据集名称
+            dataloader_func: 数据加载器函数 (默认 get_contrastive_dataloaders)
+            alpha: 损失权重系数 (可选)
         
         Returns:
-            pd.DataFrame: 包含 'checkpoint', 'test_uar', 'test_war' 的数据框。
+            Tuple[pd.DataFrame, np.ndarray, List[str]]: 
+                (评估结果DataFrame, 最佳混淆矩阵, 情感标签列表)
         """
-        logger.info("\n--- [阶段：开始在测试集上评估所有检查点] ---")
+        logger.info("\n" + "="*80)
+        logger.info(f"开始批量评估检查点: {checkpoint_pattern}")
+        logger.info("="*80)
         
-        # --- 1. 加载测试数据集 ---
-        logger.info(f"--- 正在为测试集 '{evaluation_dataset_name}' 准备Dataloader ---")
+        # --- 1. 准备数据加载器 ---
+        logger.info(f"正在为训练集 '{training_dataset_name}' 准备数据加载器...")
         try:
-            cremad_loaders = get_contrastive_dataloaders(evaluation_dataset_name)
-            evaluation_loader = cremad_loaders['evaluation']
-            cremad_emotions = CONFIG.dataset_emotions(evaluation_dataset_name)
-            logger.info(f"测试集 '{evaluation_dataset_name}' 加载完毕。")
+            train_loaders = dataloader_func(training_dataset_name)
+            validation_loader = train_loaders['validation']
+        except Exception as e:
+            logger.error(f"训练数据加载失败: {e}")
+            return pd.DataFrame(), None, []
+        
+        logger.info(f"正在为测试集 '{evaluation_dataset_name}' 准备数据加载器...")
+        try:
+            test_loaders = dataloader_func(evaluation_dataset_name)
+            test_loader = test_loaders['test'] if 'test' in test_loaders else test_loaders['evaluation']
+            test_emotions = CONFIG.dataset_emotions(evaluation_dataset_name)
         except Exception as e:
             logger.error(f"测试数据加载失败: {e}")
-            return pd.DataFrame()
+            return pd.DataFrame(), None, []
 
-        # --- 2. 查找所有模型检查点 ---
-        checkpoint_dir = CONFIG.saved_ckpt_location()
-        if not os.path.exists(checkpoint_dir):
-            logger.error(f"错误：找不到检查点目录 '{checkpoint_dir}'。")
-            return pd.DataFrame()
-            
-        checkpoint_files = [f for f in os.listdir(checkpoint_dir)
-                            if f.lower().startswith('contrastive_lgca') and f.lower().endswith('.pt')]
-        try:
-            checkpoint_files.sort(key=lambda x: int(x.split('_')[-1].split('.')[0]))
-        except ValueError:
-            logger.warning("部分检查点文件名不规范，将按默认字母顺序排序。")
-
-        if not checkpoint_files:
-            logger.error(f"在 '{checkpoint_dir}' 目录中没有找到任何检查点文件 (.pt)。")
-            return pd.DataFrame()
+        # --- 2. 查找检查点文件 ---
+        checkpoint_dir = Path(CONFIG.saved_ckpt_location())  # 修复：使用正确的检查点目录
+        if not checkpoint_dir.exists():
+            logger.error(f"错误：找不到检查点目录 '{checkpoint_dir}'")
+            return pd.DataFrame(), None, []
         
-        logger.info(f"找到了 {len(checkpoint_files)} 个检查点文件，将逐一进行评估。")
+        checkpoint_files = sorted(checkpoint_dir.glob(checkpoint_pattern))
+        if not checkpoint_files:
+            logger.warning(f"未找到符合模式的检查点: {checkpoint_pattern}")
+            return pd.DataFrame(), None, []
+        
+        logger.info(f"找到 {len(checkpoint_files)} 个检查点文件")
 
-        # --- 3. 循环评估每个检查点 ---
-        results_list = []
+        # --- 3. 获取模型参数 ---
+        num_labels = len(CONFIG.dataset_emotions(training_dataset_name))
 
-        # ⭐️ 新增：用于跟踪最佳UAR和对应的混淆矩阵
+        # --- 4. 循环评估每个检查点 ---
+        results = []
         best_uar = -1.0
         best_conf_matrix = None
-        best_cm_checkpoint_name = ""
+        best_checkpoint_name = ""
 
-        for checkpoint_file in tqdm(checkpoint_files, desc="评估所有检查点"):
+        for checkpoint_path in tqdm(checkpoint_files, desc="评估检查点"):
+            epoch = checkpoint_path.stem.split('_')[-1]
+            logger.info(f"\n{'='*60}")
+            logger.info(f"评估检查点: {checkpoint_path.name}")
+            logger.info(f"{'='*60}")
             
-            # 1. 实例化一个全新的模型并加载权重
-            # (我们使用 load_path 参数)
-            model = cls.create_or_load_model(load_path=checkpoint_file)
-            
-            # 2. 实例化一个Trainer用于评估
-            # (训练参数如lr, epochs在评估时无关紧要)
-            trainer = cls.create_trainer(model)
-            
-            # 3. 调用 eval 方法进行评估
-            logger.info(f"\n--- 正在评估: {checkpoint_file} ---")
-            test_uar, test_war, conf_matrix = trainer.eval(evaluation_loader, labels=cremad_emotions)
-            
-            # 4. 记录结果
-            results_list.append({
-                'checkpoint': checkpoint_file,
-                'test_uar': test_uar,
-                'test_war': test_war
-            })
+            try:
+                # 创建模型并加载权重
+                # 使用 ModelOps 而不是 cls，避免调用到 ContrastiveOps 的向后兼容方法
+                model = ModelOps.create_or_load_model(
+                    model_class=model_class,
+                    num_labels=num_labels,
+                    checkpoint_path=str(checkpoint_path)
+                )
+                
+                # 创建训练器
+                trainer = ModelOps.create_trainer(
+                    trainer_class=trainer_class,
+                    model=model,
+                    alpha=alpha
+                )
+                
+                # 在验证集上评估
+                logger.info(f"在 {training_dataset_name} 验证集上评估...")
+                val_uar, val_war, val_cm = trainer.eval(validation_loader)
+                logger.info(f"验证集 - UAR: {val_uar:.2f}%, WAR: {val_war:.2f}%")
+                
+                # 在测试集上评估
+                logger.info(f"在 {evaluation_dataset_name} 测试集上评估...")
+                test_uar, test_war, test_cm = trainer.eval(test_loader)
+                logger.info(f"测试集 - UAR: {test_uar:.2f}%, WAR: {test_war:.2f}%")
+                
+                # 记录结果
+                results.append({
+                    'checkpoint': checkpoint_path.name,
+                    'epoch': epoch,
+                    'val_uar': val_uar,
+                    'val_war': val_war,
+                    'test_uar': test_uar,
+                    'test_war': test_war
+                })
+                
+                # 更新最佳结果
+                if test_uar > best_uar:
+                    best_uar = test_uar
+                    best_conf_matrix = test_cm
+                    best_checkpoint_name = checkpoint_path.name
+                    logger.info(f"发现新的最佳 UAR: {best_uar:.2f}% (来自 {checkpoint_path.name})")
+                
+                # 清理内存
+                del model, trainer
+                gc.collect()
+                torch.cuda.empty_cache()
+                
+            except Exception as e:
+                logger.error(f"评估 {checkpoint_path.name} 时出错: {e}", exc_info=True)
+                continue
 
-            # 5. ⭐️ 新增：检查并保存最佳的混淆矩阵
-            if test_uar > best_uar:
-                best_uar = test_uar
-                best_conf_matrix = conf_matrix
-                best_cm_checkpoint_name = checkpoint_file
-                logger.info(f"--- 发现新的最佳 UAR: {best_uar:.4f} (来自 {checkpoint_file}) ---")
-
-            # 6. 清理内存
-            del model, trainer
-            gc.collect()
-            torch.cuda.empty_cache()
-
-        # --- 4. 结果汇总 ---
-        logger.info("\n--- [阶段：所有检查点评估完成，汇总结果] ---")
-        if not results_list:
-            logger.warning("没有评估任何模型，无法生成报告。")
-            return pd.DataFrame()
-
-        results_df = pd.DataFrame(results_list)
-        results_df = results_df.sort_values(by='test_uar', ascending=False).reset_index(drop=True)
-        # 7. ⭐️ 修改：返回df、最佳矩阵和标签
-        logger.info(f"--- 最佳混淆矩阵来自: {best_cm_checkpoint_name} ---")
+        # --- 5. 结果汇总 ---
+        if not results:
+            logger.warning("没有成功评估任何检查点")
+            return pd.DataFrame(), None, []
         
-        return results_df, best_conf_matrix, cremad_emotions
+        df_results = pd.DataFrame(results)
+        logger.info("\n" + "="*80)
+        logger.info("评估汇总:")
+        logger.info("="*80)
+        print(df_results.to_string(index=False))
+        logger.info(f"\n最佳检查点: {best_checkpoint_name} (UAR: {best_uar:.2f}%)")
+        
+        return df_results, best_conf_matrix, test_emotions
+
+
+# # 向后兼容：保留 ContrastiveOps 作为别名
+# class ContrastiveOps(ModelOps):
+#     """
+#     向后兼容的别名类
+#     推荐使用 ModelOps，但保留 ContrastiveOps 以兼容旧代码
+#     """
+    
+#     @classmethod
+#     def train(cls, trainer: ContrastiveTrainer):
+#         """使用 'train' 和 'validation' 数据集运行训练过程（向后兼容方法）"""
+#         training_dataset_name = CONFIG.training_dataset_name()
+#         return super().train(
+#             trainer=trainer,
+#             training_dataset_name=training_dataset_name,
+#             dataloader_func=get_contrastive_dataloaders
+#         )
+    
+#     @classmethod
+#     def evaluate(cls, trainer: ContrastiveTrainer, dataset_split: str):
+#         """
+#         在指定的数据集拆分上评估模型（向后兼容方法）
+        
+#         Args:
+#             trainer: 训练器实例
+#             dataset_split: 'validation' 或 'evaluation'
+            
+#         Returns:
+#             Tuple[float, float, np.ndarray]: (uar, war, confusion_matrix)
+#         """
+#         if dataset_split == 'validation':
+#             dataset_name = CONFIG.training_dataset_name()
+#         elif dataset_split == 'evaluation':
+#             dataset_name = CONFIG.evaluation_dataset_name()
+#         else:
+#             logger.error(f"未知的 dataset_split: {dataset_split}")
+#             return None, None, None
+        
+#         return super().evaluate(
+#             trainer=trainer,
+#             dataset_split=dataset_split,
+#             dataset_name=dataset_name,
+#             dataloader_func=get_contrastive_dataloaders
+#         )
+    
+#     @classmethod
+#     def create_or_load_model(cls, load_path: str = None) -> MemoryOptimizedContrastiveModel:
+#         """向后兼容的模型创建方法"""
+#         training_dataset_name = CONFIG.training_dataset_name()
+#         num_labels = len(CONFIG.dataset_emotions(training_dataset_name))
+        
+#         checkpoint_path = None
+#         if load_path:
+#             checkpoint_path = os.path.join(CONFIG.saved_ckpt_location(), load_path)
+        
+#         return super().create_or_load_model(
+#             model_class=MemoryOptimizedContrastiveModel,
+#             num_labels=num_labels,
+#             checkpoint_path=checkpoint_path
+#         )
+    
+#     @classmethod
+#     def create_trainer(cls, model: MemoryOptimizedContrastiveModel) -> ContrastiveTrainer:
+#         """向后兼容的训练器创建方法"""
+#         return super().create_trainer(
+#             trainer_class=ContrastiveTrainer,
+#             model=model
+#         )
+    
+#     @classmethod
+#     def evaluate_all_checkpoints(cls, evaluation_dataset_name: str):
+#         """向后兼容的检查点评估方法"""
+#         training_dataset_name = CONFIG.training_dataset_name()
+        
+#         return super().evaluate_all_checkpoints(
+#             model_class=MemoryOptimizedContrastiveModel,
+#             trainer_class=ContrastiveTrainer,
+#             checkpoint_pattern='Contrastive_LGCA_model_epoch_*.pt',
+#             training_dataset_name=training_dataset_name,
+#             evaluation_dataset_name=evaluation_dataset_name,
+#             dataloader_func=get_contrastive_dataloaders
+#         )
