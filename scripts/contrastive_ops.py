@@ -20,7 +20,7 @@ from typing import Union, Tuple, Optional, List, Callable
 from core.config import CONFIG, device
 from contrastive.model import MemoryOptimizedContrastiveModel, AcousticSupConModel
 from contrastive.trainer import ContrastiveTrainer, AblationNoLabelTrainer, AblationNoTextTrainer
-from scripts.get_dataloaders import get_contrastive_dataloaders, get_ablation_no_text_dataloaders
+from scripts.get_dataloaders import get_contrastive_dataloaders
 
 logger = logging.getLogger(__name__)
 
@@ -92,7 +92,10 @@ class ModelOps:
             learning_rate=CONFIG.learning_rate(),
             alpha=alpha,
             optimizer_type=CONFIG.optimizer_type(),
-            gradient_accumulation_steps=4
+            gradient_accumulation_steps=4,
+            # XBM配置
+            use_xbm=True,           # 启用XBM
+            xbm_memory_size=16384   # 记忆库大小（建议16384或更大）
         )
         return trainer
 
@@ -254,12 +257,12 @@ class ModelOps:
                 # 在验证集上评估
                 logger.info(f"在 {training_dataset_name} 验证集上评估...")
                 val_uar, val_war, val_cm = trainer.eval(validation_loader)
-                logger.info(f"验证集 - UAR: {val_uar:.2f}%, WAR: {val_war:.2f}%")
+                logger.info(f"验证集 - UAR: {val_uar*100:.2f}%, WAR: {val_war*100:.2f}%")
                 
                 # 在测试集上评估
                 logger.info(f"在 {evaluation_dataset_name} 测试集上评估...")
                 test_uar, test_war, test_cm = trainer.eval(test_loader)
-                logger.info(f"测试集 - UAR: {test_uar:.2f}%, WAR: {test_war:.2f}%")
+                logger.info(f"测试集 - UAR: {test_uar*100:.2f}%, WAR: {test_war*100:.2f}%")
                 
                 # 记录结果
                 results.append({
@@ -276,7 +279,7 @@ class ModelOps:
                     best_uar = test_uar
                     best_conf_matrix = test_cm
                     best_checkpoint_name = checkpoint_path.name
-                    logger.info(f"发现新的最佳 UAR: {best_uar:.2f}% (来自 {checkpoint_path.name})")
+                    logger.info(f"发现新的最佳 UAR: {best_uar*100:.2f}% (来自 {checkpoint_path.name})")
                 
                 # 清理内存
                 del model, trainer
@@ -297,89 +300,7 @@ class ModelOps:
         logger.info("评估汇总:")
         logger.info("="*80)
         print(df_results.to_string(index=False))
-        logger.info(f"\n最佳检查点: {best_checkpoint_name} (UAR: {best_uar:.2f}%)")
+        logger.info(f"\n最佳检查点: {best_checkpoint_name} (UAR: {best_uar*100:.2f}%)")
         
         return df_results, best_conf_matrix, test_emotions
 
-
-# # 向后兼容：保留 ContrastiveOps 作为别名
-# class ContrastiveOps(ModelOps):
-#     """
-#     向后兼容的别名类
-#     推荐使用 ModelOps，但保留 ContrastiveOps 以兼容旧代码
-#     """
-    
-#     @classmethod
-#     def train(cls, trainer: ContrastiveTrainer):
-#         """使用 'train' 和 'validation' 数据集运行训练过程（向后兼容方法）"""
-#         training_dataset_name = CONFIG.training_dataset_name()
-#         return super().train(
-#             trainer=trainer,
-#             training_dataset_name=training_dataset_name,
-#             dataloader_func=get_contrastive_dataloaders
-#         )
-    
-#     @classmethod
-#     def evaluate(cls, trainer: ContrastiveTrainer, dataset_split: str):
-#         """
-#         在指定的数据集拆分上评估模型（向后兼容方法）
-        
-#         Args:
-#             trainer: 训练器实例
-#             dataset_split: 'validation' 或 'evaluation'
-            
-#         Returns:
-#             Tuple[float, float, np.ndarray]: (uar, war, confusion_matrix)
-#         """
-#         if dataset_split == 'validation':
-#             dataset_name = CONFIG.training_dataset_name()
-#         elif dataset_split == 'evaluation':
-#             dataset_name = CONFIG.evaluation_dataset_name()
-#         else:
-#             logger.error(f"未知的 dataset_split: {dataset_split}")
-#             return None, None, None
-        
-#         return super().evaluate(
-#             trainer=trainer,
-#             dataset_split=dataset_split,
-#             dataset_name=dataset_name,
-#             dataloader_func=get_contrastive_dataloaders
-#         )
-    
-#     @classmethod
-#     def create_or_load_model(cls, load_path: str = None) -> MemoryOptimizedContrastiveModel:
-#         """向后兼容的模型创建方法"""
-#         training_dataset_name = CONFIG.training_dataset_name()
-#         num_labels = len(CONFIG.dataset_emotions(training_dataset_name))
-        
-#         checkpoint_path = None
-#         if load_path:
-#             checkpoint_path = os.path.join(CONFIG.saved_ckpt_location(), load_path)
-        
-#         return super().create_or_load_model(
-#             model_class=MemoryOptimizedContrastiveModel,
-#             num_labels=num_labels,
-#             checkpoint_path=checkpoint_path
-#         )
-    
-#     @classmethod
-#     def create_trainer(cls, model: MemoryOptimizedContrastiveModel) -> ContrastiveTrainer:
-#         """向后兼容的训练器创建方法"""
-#         return super().create_trainer(
-#             trainer_class=ContrastiveTrainer,
-#             model=model
-#         )
-    
-#     @classmethod
-#     def evaluate_all_checkpoints(cls, evaluation_dataset_name: str):
-#         """向后兼容的检查点评估方法"""
-#         training_dataset_name = CONFIG.training_dataset_name()
-        
-#         return super().evaluate_all_checkpoints(
-#             model_class=MemoryOptimizedContrastiveModel,
-#             trainer_class=ContrastiveTrainer,
-#             checkpoint_pattern='Contrastive_LGCA_model_epoch_*.pt',
-#             training_dataset_name=training_dataset_name,
-#             evaluation_dataset_name=evaluation_dataset_name,
-#             dataloader_func=get_contrastive_dataloaders
-#         )

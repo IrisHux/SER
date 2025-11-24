@@ -13,6 +13,7 @@ from core.trainer import AbstractTrainer
 from core.config import CONFIG, device
 from contrastive.model import MemoryOptimizedContrastiveModel, AcousticSupConModel
 from contrastive.loss import SupConLoss, InfoNCELoss
+from contrastive.xbm import XBM, SupConLossWithXBM
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +27,9 @@ class ContrastiveTrainer(AbstractTrainer):
     def __init__(self, model: MemoryOptimizedContrastiveModel, num_epochs: int, learning_rate: float,
                  alpha: float,  # <--- 新增参数
                  optimizer_type: str = "AdamW", 
-                 gradient_accumulation_steps: int = 4):
+                 gradient_accumulation_steps: int = 4,
+                 use_xbm: bool = True,  # <--- 新增：是否使用XBM
+                 xbm_memory_size: int = 16384):  # <--- 新增：XBM记忆库大小
 
         # --- 1. 初始化优化器和损失函数 ---
         if optimizer_type.lower() == "adamw":
@@ -64,8 +67,24 @@ class ContrastiveTrainer(AbstractTrainer):
         else: # 默认为 Adam
             optimizer = torch.optim.Adam(optimizer_parameters, lr=learning_rate, weight_decay=CONFIG.weight_decay())
 
-        # 实例化两个损失函数：监督对比损失L_LGCA 和 交叉熵损失L_SER
-        self.sup_con_loss = SupConLoss(temperature=0.1)
+        # --- [XBM修改] 初始化XBM记忆库和损失函数 ---
+        self.use_xbm = use_xbm
+        if use_xbm:
+            # 获取投影头输出维度（需要与模型保持一致）
+            proj_config = CONFIG.projection_bridge_config()
+            feat_dim = proj_config['hidden_dims'][-1]  # 最后一层的维度，例如256
+            
+            # 初始化XBM
+            self.xbm = XBM(memory_size=xbm_memory_size, feat_dim=feat_dim, device=device)
+            
+            # 使用支持XBM的损失函数
+            self.sup_con_loss = SupConLossWithXBM(temperature=0.1, xbm=self.xbm)
+            print(f"[INFO] 已启用XBM，记忆库大小: {xbm_memory_size}")
+        else:
+            self.xbm = None
+            self.sup_con_loss = SupConLoss(temperature=0.1)
+            print("[INFO] 未启用XBM，使用标准批内对比")
+        
         self.cross_entropy_loss = nn.CrossEntropyLoss()
 
         # # 从配置中获取损失的加权因子 alpha
@@ -334,6 +353,25 @@ class ContrastiveTrainer(AbstractTrainer):
 
                     # --- 3. 反向传播 ---
                     self.scaler.scale(scaled_loss).backward()
+                    
+                    # --- [XBM修改] 更新记忆库 ---
+                    # 必须在反向传播后、优化器更新前进行
+                    # 关键：必须detach特征，避免梯度回传到记忆库
+                    if self.use_xbm:
+                        with torch.no_grad():
+                            # 归一化特征（与损失函数内保持一致）
+                            acoustic_norm = nn.functional.normalize(acoustic_embedding.detach(), p=2, dim=1)
+                            if text_embedding is not None:
+                                text_norm = nn.functional.normalize(text_embedding.detach(), p=2, dim=1)
+                                # 将双模态特征和标签都入队
+                                feats_to_store = torch.cat([acoustic_norm, text_norm], dim=0)
+                                labels_to_store = labels.repeat(2)
+                            else:
+                                feats_to_store = acoustic_norm
+                                labels_to_store = labels
+                            
+                            # 入队新特征，出队旧特征
+                            self.xbm.enqueue_dequeue(feats_to_store, labels_to_store)
 
                     # [梯度检查] 检测并处理异常梯度（改进版）
                     has_nan_grad = False
@@ -395,7 +433,8 @@ class ContrastiveTrainer(AbstractTrainer):
                                        avg_val_loss, avg_val_acc, val_uar)
                 
                 # 保存最佳UAR模型
-                self._save_best_model_if_improved(val_uar, epoch)
+                if epoch > 5:
+                    self._save_best_model_if_improved(val_uar, epoch)
 
         # 所有epoch结束后，绘制训练曲线
         self.plot_histories(history_train_loss, history_train_acc, history_val_loss, history_val_acc)

@@ -70,9 +70,13 @@ def run_experiment():
             model=model,
             num_epochs=CONFIG.training_epochs(),
             learning_rate=CONFIG.learning_rate(),
+            alpha=CONFIG.llgca_loss_alpha(),  # 从配置读取alpha
             optimizer_type=CONFIG.optimizer_type(),
             # 配合config.yaml中的batch_size来设置，例如batch_size=2, steps=4 -> 有效批次=8
-            gradient_accumulation_steps=4 
+            gradient_accumulation_steps=4,
+            # XBM配置
+            use_xbm=True,           # 启用XBM
+            xbm_memory_size=16384   # 记忆库大小（建议16384或更大）
         )
     except Exception as e:
         logging.error(f"模型或训练器实例化失败: {e}")
