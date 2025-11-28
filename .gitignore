@@ -4,12 +4,13 @@ __pycache__/
 *.pt
 *.md
 *.csv
+*.json
 
 saved_models/
 dataset/
 pictures/
 tables/
-exp/
+# experiments/
 .venv/
 .github/
 .specify/

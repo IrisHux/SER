@@ -117,4 +117,4 @@ class TrainerOps:
         emotions = CONFIG.dataset_emotions()
         test_dataloader = get_dataloader("test", False)
         logger.info("Evaluating the model...")
-        trainer.eval(test_dataloader, emotions)
+        uar, war, conf_matrix = trainer.eval(test_dataloader, emotions)

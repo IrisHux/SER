@@ -21,7 +21,7 @@ class MemoryOptimizedAudioBaselineTrainer(AbstractTrainer):
     内存优化版的音频基线训练器
     """
     def __init__(self, model: nn.Module, num_epochs: int, learning_rate: float,
-                 optimizer_type: str = "Adam", gradient_accumulation_steps: int = 4):
+                 optimizer_type: str = "AdamW", gradient_accumulation_steps: int = 4):
 
         # Explicitly convert learning_rate to float to avoid TypeError
         learning_rate = float(learning_rate)
@@ -29,6 +29,8 @@ class MemoryOptimizedAudioBaselineTrainer(AbstractTrainer):
         # 根据配置选择优化器
         if optimizer_type.lower() == "adam":
             optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+        elif optimizer_type.lower() == "adamw":
+            optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
         else:
             raise ValueError(f"不支持的优化器类型: {optimizer_type}")
 
